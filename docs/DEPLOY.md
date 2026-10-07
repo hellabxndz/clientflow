@@ -13,7 +13,7 @@ app (`scripts/start-hosted.sh`). Demo workspaces never send real email.
 1. Sign in at railway.com with GitHub and create a project with **Deploy from GitHub repo** → `clientflow`.
    Railway reads `railway.json` and builds the `Dockerfile`.
 2. In the project, **Create** → **Database** → **PostgreSQL**.
-3. On the clientflow service: **Settings** → **Networking** → **Generate Domain**.
+3. On the clientflow service: **Settings** → **Networking** → **Generate Domain**, target port `3000` (it must match `PORT` below).
 4. Right-click the clientflow service → **Attach volume**, mount path `/data`.
 5. On the clientflow service → **Variables**, add:
 
@@ -24,6 +24,7 @@ app (`scripts/start-hosted.sh`). Demo workspaces never send real email.
    | `SESSION_SECRET` | 64 random hex characters (`openssl rand -hex 32`) |
    | `INTEGRATION_ENCRYPTION_KEY` | another 64 random hex characters |
    | `CRON_SECRET` | 48 random hex characters |
+   | `PORT` | `3000` |
 
 6. Deploy. The first boot takes a minute while it migrates and seeds. Sign in with
    `olivia@northstar.example.com` / `demo-password-123` (staff admin) or

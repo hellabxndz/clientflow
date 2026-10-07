@@ -22,4 +22,4 @@ if [ "$SEED_DEMO" != "false" ]; then
   npx tsx scripts/seed.ts
 fi
 
-exec npx next start -p "${PORT:-3000}"
+exec npx next start -H 0.0.0.0 -p "${PORT:-3000}"
