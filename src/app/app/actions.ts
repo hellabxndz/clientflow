@@ -4,33 +4,30 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { withTenant } from "@/lib/db";
 import { tenantCtx, revokeAllSessionsForUser, revokeSession, type AuthContext } from "@/lib/auth";
+import type { Tx } from "@/lib/db";
 import { actionAuth } from "@/lib/session";
 import { audit } from "@/lib/audit";
-import { createOnboardingFromTemplate, publishTemplate, validateTemplateContent } from "@/lib/templates";
+import { applyTemplateUpgrade, createOnboardingFromTemplate, planTemplateUpgrade, publishTemplate, SENSITIVE_CATEGORIES, validateTemplateContent } from "@/lib/templates";
 import { ACCOUNTING_TEMPLATE, AGENCY_TEMPLATE, BLANK_TEMPLATE } from "@/lib/template-library";
 import { createInvitation, sendInvitationEmail } from "@/lib/invitations";
 import { computeOnboardingState, unmetDependencies, type ItemLike } from "@/lib/onboarding";
-import { assist, type AssistKind } from "@/lib/ai";
+import { assist, ASSIST_LABEL, type AssistKind } from "@/lib/ai";
 import { runReminders, renderReminder, type ReminderRule } from "@/lib/reminders";
 import { runRetention } from "@/lib/retention";
 import { sendEmail } from "@/lib/email";
 import { isValidTimeZone } from "@/lib/time";
 import { uploadDocument } from "@/lib/files";
+import { notify } from "@/lib/notifications";
+import { can } from "@/lib/permissions";
+import * as h from "@/lib/action-helpers";
+import { emitEvent } from "@/lib/automation/engine";
 import type { ActionState } from "@/components/forms";
 
-const str = (fd: FormData, k: string) => String(fd.get(k) ?? "").trim();
-const optional = (fd: FormData, k: string) => str(fd, k) || null;
-
-function fail(e: unknown): ActionState {
-  if (e && typeof e === "object" && "digest" in e && String((e as { digest: string }).digest).startsWith("NEXT_REDIRECT")) throw e;
-  const message = e instanceof Error ? e.message : "Something went wrong.";
-  if (/row-level security|permission denied/i.test(message)) return { error: "You don't have permission to do that." };
-  return { error: message };
-}
-
-function workspaceOf(auth: AuthContext) {
-  return { id: auth.workspace.id, name: auth.workspace.name, is_demo: auth.workspace.is_demo, email_from_name: auth.workspace.email_from_name };
-}
+const str = h.str;
+const optional = h.optional;
+const fail = h.fail;
+const workspaceOf = h.workspaceOf;
+const afterWrite = h.afterWrite;
 
 // ---------------------------------------------------------------------------
 // Clients and onboardings
@@ -74,6 +71,7 @@ export async function createClientAction(_: ActionState, fd: FormData): Promise<
       }
       return { clientId: client!.id, inviteUrl, emailStatus };
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app");
     return { ok: `${name} was added.`, data: result };
   } catch (e) {
@@ -97,6 +95,7 @@ export async function startOnboardingAction(_: ActionState, fd: FormData): Promi
       });
       await audit(tx, ctx, "onboarding.created", "onboarding", onboardingId, `Started onboarding (template v${templateVersion})`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath(`/app/clients/${clientId}`);
     return { ok: "Onboarding started." };
   } catch (e) {
@@ -135,12 +134,14 @@ export async function setOnboardingStatusAction(_: ActionState, fd: FormData): P
       const o = await tx.one<{ status: string; client_id: string }>("select status, client_id from onboardings where id = $1", [id]);
       if (!o) throw new Error("Onboarding not found.");
       if (o.status === "completed") throw new Error("Completed onboardings can't be changed.");
+      if (o.status === to) return;
       await tx.q(
         `update onboardings set status = $2, paused_at = case when $2 = 'paused' then now() else paused_at end where id = $1`,
         [id, to],
       );
       await audit(tx, ctx, `onboarding.${to === "active" ? "resumed" : to}`, "onboarding", id, `Onboarding ${to === "active" ? "resumed" : to}`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: to === "paused" ? "Onboarding paused. Reminders are stopped." : to === "active" ? "Onboarding resumed." : "Onboarding cancelled." };
   } catch (e) {
@@ -181,7 +182,11 @@ export async function approveCompletionAction(_: ActionState, fd: FormData): Pro
       const items = await tx.q<ItemLike>("select * from onboarding_items where onboarding_id = $1", [id]);
       const state = computeOnboardingState(o, items);
       if (!state.readyForCompletion)
-        throw new Error(`${state.progress.requiredTotal - state.progress.requiredApproved} required item(s) are not approved yet.`);
+        throw new Error(
+          state.progress.requiredTotal === 0
+            ? "This onboarding has no required items to approve."
+            : `${state.progress.requiredTotal - state.progress.requiredApproved} required item(s) are not approved yet.`,
+        );
       await tx.q("update onboardings set status = 'completed', completed_at = now(), completed_by = $2, completion_note = $3 where id = $1", [
         id,
         auth.user.id,
@@ -189,8 +194,203 @@ export async function approveCompletionAction(_: ActionState, fd: FormData): Pro
       ]);
       await audit(tx, ctx, "onboarding.completed", "onboarding", id, `Approved onboarding completion`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Onboarding marked complete. The client is ready to start." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/** Marks (or clears) Ready for Kickoff by hand. The database emits ready_for_kickoff so handoff rules run. */
+export async function markReadyForKickoffAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("staff");
+    if (!auth.canApprove) return { error: "You don't have approval permission, so you can't mark clients Ready for Kickoff." };
+    const ctx = tenantCtx(auth);
+    const id = str(fd, "onboardingId");
+    const ready = str(fd, "ready") !== "false";
+    const msg = await withTenant(ctx, async (tx) => {
+      const o = await tx.one<{ status: string; kickoff_ready_at: Date | null; owner_user_id: string | null }>(
+        "select status, kickoff_ready_at, owner_user_id from onboardings where id = $1 for update",
+        [id],
+      );
+      if (!o) throw new Error("Onboarding not found.");
+      if (o.status !== "active") throw new Error("Only active onboardings can be marked Ready for Kickoff.");
+      if (ready) {
+        if (o.kickoff_ready_at) throw new Error("This client is already Ready for Kickoff.");
+        const items = await tx.q<ItemLike>("select * from onboarding_items where onboarding_id = $1", [id]);
+        const state = computeOnboardingState({ id, status: "active", owner_user_id: o.owner_user_id }, items);
+        const outstanding = state.progress.requiredTotal - state.progress.requiredApproved;
+        await tx.q("update onboardings set kickoff_ready_at = now() where id = $1", [id]);
+        await audit(tx, ctx, "onboarding.ready_for_kickoff", "onboarding", id,
+          `Marked Ready for Kickoff manually${outstanding ? ` with ${outstanding} required item${outstanding === 1 ? "" : "s"} still outstanding` : ""}`,
+          { outstanding, readiness: state.readiness.score });
+        return "Marked Ready for Kickoff. Handoff automations will run.";
+      }
+      if (!o.kickoff_ready_at) throw new Error("This client isn't marked Ready for Kickoff.");
+      await tx.q("update onboardings set kickoff_ready_at = null where id = $1", [id]);
+      await audit(tx, ctx, "onboarding.ready_cleared", "onboarding", id, "Cleared Ready for Kickoff");
+      return "Ready for Kickoff cleared.";
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: msg };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function setKickoffDateAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("staff");
+    const ctx = tenantCtx(auth);
+    const id = str(fd, "onboardingId");
+    const date = str(fd, "kickoffDate");
+    if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date + "T12:00:00Z")))) return { error: "Choose a valid date." };
+    await withTenant(ctx, async (tx) => {
+      const o = await tx.one<{ status: string }>("select status from onboardings where id = $1", [id]);
+      if (!o) throw new Error("Onboarding not found.");
+      if (o.status === "cancelled") throw new Error("This onboarding was cancelled.");
+      await tx.q("update onboardings set kickoff_date = $2 where id = $1", [id, date || null]);
+      await audit(tx, ctx, "onboarding.kickoff_date", "onboarding", id, date ? `Set kickoff date to ${date}` : "Cleared the kickoff date");
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: date ? "Kickoff date saved." : "Kickoff date cleared." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function setAtRiskAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("staff");
+    const ctx = tenantCtx(auth);
+    const id = str(fd, "onboardingId");
+    const atRisk = str(fd, "atRisk") === "true";
+    const reason = str(fd, "reason").slice(0, 500);
+    if (atRisk && reason.length < 3) return { error: "Say why this client is at risk." };
+    await withTenant(ctx, async (tx) => {
+      const o = await tx.one<{ status: string }>("select status from onboardings where id = $1", [id]);
+      if (!o) throw new Error("Onboarding not found.");
+      await tx.q(
+        `update onboardings set at_risk = $2, at_risk_reason = case when $2 then $3 else null end,
+           at_risk_at = case when $2 then now() else null end where id = $1`,
+        [id, atRisk, reason || null],
+      );
+      await audit(tx, ctx, atRisk ? "onboarding.at_risk" : "onboarding.at_risk_cleared", "onboarding", id,
+        atRisk ? `Flagged At Risk: ${reason}` : "Cleared the At Risk flag");
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: atRisk ? "Flagged At Risk." : "At Risk flag cleared." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/** Managers can drop a requirement from a live onboarding. Its history and files are kept. */
+export async function removeRequirementAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("manager");
+    const ctx = tenantCtx(auth);
+    const itemId = str(fd, "itemId");
+    const reason = str(fd, "reason").slice(0, 300);
+    await withTenant(ctx, async (tx) => {
+      const item = await lockItem(tx, itemId);
+      if (item.onboarding_status === "completed" || item.onboarding_status === "cancelled") throw new Error("This onboarding is closed.");
+      if (item.removed_at) throw new Error("This requirement was already removed.");
+      await tx.q("update onboarding_items set removed_at = now(), updated_at = now() where id = $1", [itemId]);
+      const dependents = await tx.q<{ title: string }>(
+        "select title from onboarding_items where onboarding_id = $1 and removed_at is null and $2 = any(depends_on)",
+        [item.onboarding_id, item.item_key],
+      );
+      await audit(tx, ctx, "item.removed", "item", itemId,
+        `Removed requirement "${item.title}"${reason ? `: ${reason}` : ""}${dependents.length ? ` (no longer blocks ${dependents.map((d) => `"${d.title}"`).join(", ")})` : ""}`,
+        { reason, required: item.required });
+      // Removing the last outstanding requirement completes the checklist even though no status changed.
+      const left = await tx.one<{ open: number; total: number }>(
+        `select count(*) filter (where status <> 'approved')::int as open, count(*)::int as total
+         from onboarding_items where onboarding_id = $1 and required and removed_at is null`,
+        [item.onboarding_id],
+      );
+      if (item.required && item.status !== "approved" && left && left.total > 0 && left.open === 0)
+        await emitEvent(tx, {
+          workspace_id: auth.workspace.id,
+          type: "all_required_completed",
+          client_id: item.client_id,
+          onboarding_id: item.onboarding_id,
+          item_id: null,
+          payload: { via: "requirement_removed" },
+          actorUserId: auth.user.id,
+        });
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: "Requirement removed. It no longer counts toward readiness and the client no longer sees it." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function restoreRequirementAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("manager");
+    const ctx = tenantCtx(auth);
+    const itemId = str(fd, "itemId");
+    await withTenant(ctx, async (tx) => {
+      const item = await lockItem(tx, itemId);
+      if (!item.removed_at) throw new Error("This requirement is not removed.");
+      if (item.onboarding_status === "completed" || item.onboarding_status === "cancelled") throw new Error("This onboarding is closed.");
+      await tx.q("update onboarding_items set removed_at = null, updated_at = now() where id = $1", [itemId]);
+      await audit(tx, ctx, "item.restored", "item", itemId, `Restored requirement "${item.title}"`);
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: "Requirement restored." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/** Read-only: what upgrading this onboarding to the latest published template version would change. */
+export async function previewTemplateUpgradeAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("manager");
+    const plan = await withTenant(tenantCtx(auth), (tx) => planTemplateUpgrade(tx, str(fd, "onboardingId")));
+    if (!plan) return { ok: "This onboarding already uses the latest template version." };
+    return { ok: "", data: plan };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function applyTemplateUpgradeAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("manager");
+    if (!can(auth.role, "upgradeOnboardings")) return { error: "Only managers can upgrade onboardings." };
+    if (!h.bool(fd, "confirm")) return { error: "Confirm that you reviewed the changes before applying the upgrade." };
+    const ctx = tenantCtx(auth);
+    const id = str(fd, "onboardingId");
+    const plan = await withTenant(ctx, async (tx) => {
+      const o = await tx.one<{ status: string; template_name: string | null }>("select status, template_name from onboardings where id = $1", [id]);
+      if (!o) throw new Error("Onboarding not found.");
+      if (o.status === "completed" || o.status === "cancelled") throw new Error("Closed onboardings can't be upgraded.");
+      const expected = str(fd, "toVersion");
+      const preview = await planTemplateUpgrade(tx, id);
+      if (!preview) throw new Error("This onboarding already uses the latest template version.");
+      if (expected && Number(expected) !== preview.toVersion)
+        throw new Error(`A newer version (v${preview.toVersion}) was published since you previewed. Preview again.`);
+      const p = await applyTemplateUpgrade(tx, id);
+      await audit(tx, ctx, "onboarding.template_upgraded", "onboarding", id,
+        `Upgraded ${o.template_name ?? "template"} from v${p.fromVersion ?? "?"} to v${p.toVersion}: ${p.added.length} added, ${p.updated.length} updated, ${p.keptStarted.length + p.keptRemoved.length} kept because started, ${p.removed.length} removed`,
+        { added: p.added.map((a) => a.key), updated: p.updated.map((u) => u.key), kept: p.keptStarted.map((k) => k.key), removed: p.removed.map((r) => r.key) });
+      return p;
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: `Upgraded to v${plan.toVersion}.`, data: plan };
   } catch (e) {
     return fail(e);
   }
@@ -199,6 +399,48 @@ export async function approveCompletionAction(_: ActionState, fd: FormData): Pro
 // ---------------------------------------------------------------------------
 // Items, reviews, tasks, comments
 // ---------------------------------------------------------------------------
+
+interface LockedItem {
+  id: string;
+  item_key: string;
+  title: string;
+  status: string;
+  audience: string;
+  kind: string;
+  required: boolean;
+  category: string | null;
+  reviewer_user_id: string | null;
+  removed_at: Date | null;
+  client_id: string;
+  client_name: string;
+  onboarding_id: string;
+  onboarding_status: string;
+}
+
+async function lockItem(tx: Tx, itemId: string) {
+  const item = await tx.one<LockedItem>(
+    `select i.id, i.item_key, i.title, i.status, i.audience, i.kind, i.required, i.category, i.reviewer_user_id, i.removed_at,
+            i.client_id, c.name as client_name, i.onboarding_id, o.status as onboarding_status
+     from onboarding_items i join onboardings o on o.id = i.onboarding_id join clients c on c.id = i.client_id
+     where i.id = $1 for update of i`,
+    [itemId],
+  );
+  if (!item) throw new Error("Item not found.");
+  return item;
+}
+
+function assertReviewable(item: LockedItem) {
+  if (item.onboarding_status === "completed") throw new Error("This onboarding is already complete.");
+  if (item.onboarding_status === "cancelled") throw new Error("This onboarding was cancelled.");
+  if (item.removed_at) throw new Error("This requirement was removed from the onboarding.");
+}
+
+async function insertComment(tx: Tx, auth: AuthContext, item: { client_id: string; onboarding_id: string; id: string | null }, visibility: "client" | "internal", body: string) {
+  await tx.q(
+    "insert into comments (workspace_id, client_id, onboarding_id, item_id, author_user_id, visibility, body) values ($1,$2,$3,$4,$5,$6,$7)",
+    [auth.workspace.id, item.client_id, item.onboarding_id, item.id, auth.user.id, visibility, body.slice(0, 5000)],
+  );
+}
 
 export async function addQuestionAction(_: ActionState, fd: FormData): Promise<ActionState> {
   try {
@@ -220,6 +462,7 @@ export async function addQuestionAction(_: ActionState, fd: FormData): Promise<A
       );
       await audit(tx, ctx, "item.question_added", "item", item!.id, `Asked the client: ${question.slice(0, 120)}`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Question sent to the client's checklist." };
   } catch (e) {
@@ -252,6 +495,7 @@ export async function addTaskAction(_: ActionState, fd: FormData): Promise<Actio
       );
       await audit(tx, ctx, "task.created", "item", item!.id, `Created task "${title.slice(0, 120)}"`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Task added." };
   } catch (e) {
@@ -259,55 +503,129 @@ export async function addTaskAction(_: ActionState, fd: FormData): Promise<Actio
   }
 }
 
-export async function reviewItemAction(_: ActionState, fd: FormData): Promise<ActionState> {
+/** Submitted → Under Review. The person starting the review becomes the reviewer if none is assigned. */
+export async function startReviewAction(_: ActionState, fd: FormData): Promise<ActionState> {
   try {
     const auth = await actionAuth("staff");
     const ctx = tenantCtx(auth);
     const itemId = str(fd, "itemId");
+    await withTenant(ctx, async (tx) => {
+      const item = await lockItem(tx, itemId);
+      assertReviewable(item);
+      if (item.status !== "submitted") throw new Error(item.status === "under_review" ? "This item is already under review." : "Only submitted items can be reviewed.");
+      await tx.q(
+        "update onboarding_items set status = 'under_review', reviewer_user_id = coalesce(reviewer_user_id, $2), updated_at = now() where id = $1",
+        [itemId, auth.user.id],
+      );
+      await audit(tx, ctx, "item.review_started", "item", itemId, `Started reviewing "${item.title}"`);
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: "Review started. The client can't edit this item until you respond." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function reviewItemAction(prev: ActionState, fd: FormData): Promise<ActionState> {
+  try {
     const decision = str(fd, "decision");
+    if (decision === "start") return startReviewAction(prev, fd);
+    const auth = await actionAuth("staff");
+    const ctx = tenantCtx(auth);
+    const itemId = str(fd, "itemId");
     const note = str(fd, "note");
+    const internalNote = str(fd, "internalNote");
     if (decision !== "approve" && decision !== "changes") return { error: "Choose approve or request changes." };
+    if (!auth.canApprove) return { error: "You don't have approval permission. Ask an admin to grant it, or reassign the review." };
     if (decision === "changes" && note.length < 3) return { error: "Tell the client what needs to change." };
     await withTenant(ctx, async (tx) => {
-      const item = await tx.one<{ id: string; title: string; status: string; audience: string; kind: string; client_id: string; onboarding_id: string; onboarding_status: string }>(
-        `select i.id, i.title, i.status, i.audience, i.kind, i.client_id, i.onboarding_id, o.status as onboarding_status
-         from onboarding_items i join onboardings o on o.id = i.onboarding_id where i.id = $1 for update of i`,
-        [itemId],
-      );
-      if (!item) throw new Error("Item not found.");
-      if (item.onboarding_status === "completed") throw new Error("This onboarding is already complete.");
+      const item = await lockItem(tx, itemId);
+      assertReviewable(item);
+      if (item.kind === "task") throw new Error("Internal tasks are marked done, not reviewed.");
+      if (item.status === "approved") throw new Error("This item is already approved.");
+      if (decision === "changes" && item.status !== "submitted" && item.status !== "under_review")
+        throw new Error("Only submitted items can be sent back. Leave the client a comment instead.");
       if (decision === "approve" && item.kind === "file") {
-        const [{ n }] = await tx.q<{ n: number }>("select count(*)::int as n from documents where item_id = $1", [itemId]);
-        if (n === 0) throw new Error("There are no files to approve yet.");
-        const [{ infected }] = await tx.q<{ infected: number }>(
-          `select count(*)::int as infected from document_versions v join documents d on d.id = v.document_id
-           where d.item_id = $1 and v.scan_status = 'infected'`,
+        const docs = await tx.q<{ review_status: string; scan_status: string }>(
+          `select distinct on (v.document_id) v.review_status, v.scan_status from document_versions v join documents d on d.id = v.document_id
+           where d.item_id = $1 order by v.document_id, v.version desc`,
           [itemId],
         );
-        if (infected) throw new Error("A file on this request was flagged by the scanner.");
+        if (docs.length === 0) throw new Error("There are no files to approve yet.");
+        if (docs.some((d) => d.scan_status === "infected")) throw new Error("A file on this request was flagged by the scanner.");
+        if (docs.some((d) => d.review_status === "rejected" || d.review_status === "changes_requested"))
+          throw new Error("The latest version of a file was sent back. Wait for a new upload, or accept that file first.");
       }
       const status = decision === "approve" ? "approved" : "changes_requested";
-      await tx.q("update onboarding_items set status = $2, reviewed_at = now(), reviewed_by = $3, updated_at = now() where id = $1", [itemId, status, auth.user.id]);
+      await tx.q(
+        `update onboarding_items set status = $2, reviewed_at = now(), reviewed_by = $3, reviewer_user_id = coalesce(reviewer_user_id, $3), updated_at = now()
+         where id = $1`,
+        [itemId, status, auth.user.id],
+      );
       if (item.kind === "file") {
-        // Latest version of each document follows the item decision unless already decided individually.
+        // The latest version of each document follows the item decision unless it was already decided individually.
         await tx.q(
           `update document_versions v set review_status = $2, reviewed_by = $3, reviewed_at = now(), review_note = coalesce(nullif($4, ''), v.review_note)
            where v.review_status = 'pending' and v.id in (
              select distinct on (v2.document_id) v2.id from document_versions v2 join documents d on d.id = v2.document_id
              where d.item_id = $1 order by v2.document_id, v2.version desc)`,
-          [itemId, status === "approved" ? "approved" : "changes_requested", auth.user.id, note],
+          [itemId, status, auth.user.id, note],
         );
       }
-      if (note)
-        await tx.q(
-          "insert into comments (workspace_id, client_id, onboarding_id, item_id, author_user_id, visibility, body) values ($1,$2,$3,$4,$5,'client',$6)",
-          [auth.workspace.id, item.client_id, item.onboarding_id, itemId, auth.user.id, note],
-        );
+      if (note) await insertComment(tx, auth, item, item.audience === "client" ? "client" : "internal", note);
+      if (internalNote) await insertComment(tx, auth, item, "internal", internalNote);
+      const sensitive = !!item.category && SENSITIVE_CATEGORIES.has(item.category);
       await audit(tx, ctx, decision === "approve" ? "item.approved" : "item.changes_requested", "item", itemId,
-        `${decision === "approve" ? "Approved" : "Requested changes on"} "${item.title}"`);
+        `${decision === "approve" ? "Approved" : "Requested changes on"} "${item.title}"`, { category: item.category, sensitive, humanReview: true });
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: decision === "approve" ? "Approved." : "Changes requested. The client will see your note." };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/** Assigns (or clears) the staff member responsible for reviewing an item, and notifies them. */
+export async function reassignReviewerAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("staff");
+    if (!can(auth.role, "reassignReviews")) return { error: "You can't reassign reviews." };
+    const ctx = tenantCtx(auth);
+    const itemId = str(fd, "itemId");
+    const reviewerId = optional(fd, "reviewerId");
+    const msg = await withTenant(ctx, async (tx) => {
+      const item = await lockItem(tx, itemId);
+      assertReviewable(item);
+      let reviewerName: string | null = null;
+      if (reviewerId) {
+        const m = await tx.one<{ name: string }>(
+          "select u.name from memberships m join users u on u.id = m.user_id where m.user_id = $1 and m.role in ('admin', 'manager', 'staff')",
+          [reviewerId],
+        );
+        if (!m) throw new Error("Choose a team member in this workspace.");
+        reviewerName = m.name;
+      }
+      if ((item.reviewer_user_id ?? null) === reviewerId) return "No change.";
+      await tx.q("update onboarding_items set reviewer_user_id = $2, updated_at = now() where id = $1", [itemId, reviewerId]);
+      await audit(tx, ctx, "item.reviewer_assigned", "item", itemId,
+        reviewerId ? `Assigned ${reviewerName} to review "${item.title}"` : `Cleared the reviewer on "${item.title}"`, { reviewerId });
+      if (reviewerId && reviewerId !== auth.user.id)
+        await notify(tx, {
+          workspace: workspaceOf(auth),
+          userIds: [reviewerId],
+          kind: "review_assigned",
+          title: `${auth.user.name} assigned you to review "${item.title}" for ${item.client_name}`,
+          body: item.status === "submitted" || item.status === "under_review" ? "It's waiting in your review queue." : "You'll review it once the client submits it.",
+          link: `/app/clients/${item.client_id}/items/${item.id}`,
+          onboardingId: item.onboarding_id,
+        });
+      return reviewerId ? `${reviewerName} is now the reviewer.` : "Reviewer cleared.";
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: msg };
   } catch (e) {
     return fail(e);
   }
@@ -319,14 +637,15 @@ export async function reopenItemAction(_: ActionState, fd: FormData): Promise<Ac
     const ctx = tenantCtx(auth);
     const itemId = str(fd, "itemId");
     await withTenant(ctx, async (tx) => {
-      const item = await tx.one<{ title: string; audience: string }>("select title, audience from onboarding_items where id = $1", [itemId]);
-      if (!item) throw new Error("Item not found.");
+      const item = await lockItem(tx, itemId);
+      assertReviewable(item);
       await tx.q("update onboarding_items set status = $2, reviewed_at = null, reviewed_by = null, updated_at = now() where id = $1", [
         itemId,
         item.audience === "client" ? "changes_requested" : "in_progress",
       ]);
       await audit(tx, ctx, "item.reopened", "item", itemId, `Reopened "${item.title}"`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Reopened." };
   } catch (e) {
@@ -348,6 +667,7 @@ export async function updateItemAction(_: ActionState, fd: FormData): Promise<Ac
       if (!item) throw new Error("Item not found.");
       await audit(tx, ctx, "item.updated", "item", itemId, `Updated due date, owner or requirement for "${item.title}"`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Saved." };
   } catch (e) {
@@ -369,6 +689,7 @@ export async function setTaskStatusAction(_: ActionState, fd: FormData): Promise
       );
       if (!item || item.audience !== "internal") throw new Error("Task not found.");
       if (item.onboarding_status === "completed") throw new Error("This onboarding is already complete.");
+      if (item.removed_at) throw new Error("This task was removed from the onboarding.");
       if (status === "approved") {
         const siblings = await tx.q<ItemLike>("select * from onboarding_items where onboarding_id = $1", [item.onboarding_id]);
         const unmet = unmetDependencies(item, new Map(siblings.map((s) => [s.item_key, s])));
@@ -380,6 +701,7 @@ export async function setTaskStatusAction(_: ActionState, fd: FormData): Promise
       );
       await audit(tx, ctx, "task.status", "item", itemId, `Marked task "${item.title}" ${status === "approved" ? "done" : status.replace("_", " ")}`);
     });
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Updated." };
   } catch (e) {
@@ -394,13 +716,18 @@ export async function addCommentAction(_: ActionState, fd: FormData): Promise<Ac
     const body = str(fd, "body");
     const visibility = str(fd, "visibility") === "client" ? "client" : "internal";
     if (!body) return { error: "Write a message first." };
+    const itemId = optional(fd, "itemId");
     await withTenant(ctx, async (tx) => {
       const o = await tx.one<{ client_id: string }>("select client_id from onboardings where id = $1", [str(fd, "onboardingId")]);
       if (!o) throw new Error("Onboarding not found.");
-      await tx.q(
-        "insert into comments (workspace_id, client_id, onboarding_id, item_id, author_user_id, visibility, body) values ($1,$2,$3,$4,$5,$6,$7)",
-        [auth.workspace.id, o.client_id, str(fd, "onboardingId"), optional(fd, "itemId"), auth.user.id, visibility, body.slice(0, 5000)],
-      );
+      if (itemId) {
+        const item = await tx.one<{ audience: string }>("select audience from onboarding_items where id = $1 and onboarding_id = $2", [itemId, str(fd, "onboardingId")]);
+        if (!item) throw new Error("Item not found.");
+        if (item.audience === "internal" && visibility === "client") throw new Error("Internal tasks can only have internal notes.");
+      }
+      await insertComment(tx, auth, { client_id: o.client_id, onboarding_id: str(fd, "onboardingId"), id: itemId }, visibility, body);
+      await audit(tx, ctx, visibility === "client" ? "comment.client" : "comment.internal", itemId ? "item" : "onboarding", itemId ?? str(fd, "onboardingId"),
+        `${visibility === "client" ? "Messaged the client" : "Added an internal note"}: ${body.slice(0, 120)}`);
     });
     revalidatePath("/app", "layout");
     return { ok: visibility === "client" ? "Sent to the client." : "Internal note saved." };
@@ -409,6 +736,10 @@ export async function addCommentAction(_: ActionState, fd: FormData): Promise<Ac
   }
 }
 
+/**
+ * Review one file version: approve, request changes, or reject. Rejecting or requesting changes sends the
+ * request back to the client. Optionally records an expiry date and a note (client-visible or internal).
+ */
 export async function reviewDocumentAction(_: ActionState, fd: FormData): Promise<ActionState> {
   try {
     const auth = await actionAuth("staff");
@@ -416,32 +747,82 @@ export async function reviewDocumentAction(_: ActionState, fd: FormData): Promis
     const versionId = str(fd, "versionId");
     const decision = str(fd, "decision");
     const note = str(fd, "note");
-    if (decision !== "approved" && decision !== "changes_requested") return { error: "Invalid decision." };
-    if (decision === "changes_requested" && !note) return { error: "Add a note explaining what to change." };
-    await withTenant(ctx, async (tx) => {
-      const v = await tx.one<{ original_name: string; scan_status: string; item_id: string; client_id: string; onboarding_id: string }>(
-        `select v.original_name, v.scan_status, d.item_id, d.client_id, d.onboarding_id from document_versions v join documents d on d.id = v.document_id where v.id = $1`,
+    const noteVisibility = str(fd, "noteVisibility") === "internal" ? "internal" : "client";
+    const expiresRaw = fd.has("expiresOn") ? str(fd, "expiresOn") : undefined;
+    if (!["approved", "changes_requested", "rejected"].includes(decision)) return { error: "Invalid decision." };
+    if (!auth.canApprove) return { error: "You don't have approval permission. Ask an admin, or reassign the review." };
+    if (decision !== "approved" && note.length < 3) return { error: "Add a note explaining what's wrong with the file." };
+    if (decision !== "approved" && noteVisibility === "internal") return { error: "The client needs to see why the file was sent back. Make the note visible to the client." };
+    if (expiresRaw && (!/^\d{4}-\d{2}-\d{2}$/.test(expiresRaw) || Number.isNaN(Date.parse(expiresRaw)))) return { error: "Choose a valid expiry date." };
+    const msg = await withTenant(ctx, async (tx) => {
+      const v = await tx.one<{ original_name: string; scan_status: string; item_id: string; client_id: string; onboarding_id: string; is_latest: boolean }>(
+        `select v.original_name, v.scan_status, d.item_id, d.client_id, d.onboarding_id,
+                v.version = (select max(v2.version) from document_versions v2 where v2.document_id = v.document_id) as is_latest
+         from document_versions v join documents d on d.id = v.document_id where v.id = $1`,
         [versionId],
       );
       if (!v) throw new Error("File not found.");
+      const item = await lockItem(tx, v.item_id);
+      assertReviewable(item);
       if (decision === "approved" && v.scan_status === "infected") throw new Error("Infected files can't be approved.");
-      await tx.q("update document_versions set review_status = $2, review_note = $3, reviewed_by = $4, reviewed_at = now() where id = $1", [
-        versionId,
-        decision,
-        note || null,
-        auth.user.id,
-      ]);
-      if (decision === "changes_requested") {
-        await tx.q("update onboarding_items set status = 'changes_requested', reviewed_at = now(), reviewed_by = $2, updated_at = now() where id = $1 and status <> 'approved'", [v.item_id, auth.user.id]);
+      await tx.q(
+        `update document_versions set review_status = $2, review_note = $3, reviewed_by = $4, reviewed_at = now(),
+           expires_on = case when $5::boolean then $6::date else expires_on end where id = $1`,
+        [versionId, decision, note || null, auth.user.id, expiresRaw !== undefined, expiresRaw || null],
+      );
+      let itemMsg = "";
+      if (decision !== "approved" && v.is_latest && item.status !== "changes_requested") {
         await tx.q(
-          "insert into comments (workspace_id, client_id, onboarding_id, item_id, author_user_id, visibility, body) values ($1,$2,$3,$4,$5,'client',$6)",
-          [auth.workspace.id, v.client_id, v.onboarding_id, v.item_id, auth.user.id, `${v.original_name}: ${note}`],
+          `update onboarding_items set status = 'changes_requested', reviewed_at = now(), reviewed_by = $2,
+             reviewer_user_id = coalesce(reviewer_user_id, $2), updated_at = now() where id = $1`,
+          [v.item_id, auth.user.id],
         );
+        itemMsg = " The request is back with the client.";
       }
-      await audit(tx, ctx, `document.${decision}`, "document_version", versionId, `${decision === "approved" ? "Approved" : "Requested changes on"} file "${v.original_name}"`);
+      if (note) await insertComment(tx, auth, item, noteVisibility, `${v.original_name}: ${note}`);
+      if (decision === "approved" && h.bool(fd, "approveItem") && (item.status === "submitted" || item.status === "under_review")) {
+        const open = await tx.one<{ n: number }>(
+          `select count(*)::int as n from (select distinct on (v.document_id) v.review_status from document_versions v join documents d on d.id = v.document_id
+           where d.item_id = $1 order by v.document_id, v.version desc) latest where review_status <> 'approved'`,
+          [v.item_id],
+        );
+        if (open?.n === 0) {
+          await tx.q(
+            `update onboarding_items set status = 'approved', reviewed_at = now(), reviewed_by = $2, reviewer_user_id = coalesce(reviewer_user_id, $2),
+               updated_at = now() where id = $1`,
+            [v.item_id, auth.user.id],
+          );
+          await audit(tx, ctx, "item.approved", "item", v.item_id, `Approved "${item.title}"`, { category: item.category, humanReview: true });
+          itemMsg = " The request is approved.";
+        } else itemMsg = " Other files on this request still need a decision.";
+      }
+      const verb = decision === "approved" ? "Accepted" : decision === "rejected" ? "Rejected" : "Requested changes on";
+      await audit(tx, ctx, `document.${decision}`, "document_version", versionId,
+        `${verb} file "${v.original_name}"${expiresRaw ? ` (expires ${expiresRaw})` : ""}`, { category: item.category, humanReview: true });
+      return `${decision === "approved" ? "File accepted." : decision === "rejected" ? "File rejected." : "Changes requested."}${itemMsg}`;
+    });
+    await afterWrite(auth.workspace.id);
+    revalidatePath("/app", "layout");
+    return { ok: msg };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+export async function setDocumentExpiryAction(_: ActionState, fd: FormData): Promise<ActionState> {
+  try {
+    const auth = await actionAuth("staff");
+    const ctx = tenantCtx(auth);
+    const versionId = str(fd, "versionId");
+    const date = str(fd, "expiresOn");
+    if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date)))) return { error: "Choose a valid date." };
+    await withTenant(ctx, async (tx) => {
+      const v = await tx.one<{ original_name: string }>("update document_versions set expires_on = $2 where id = $1 returning original_name", [versionId, date || null]);
+      if (!v) throw new Error("File not found.");
+      await audit(tx, ctx, "document.expiry", "document_version", versionId, date ? `Set "${v.original_name}" to expire on ${date}` : `Cleared the expiry date on "${v.original_name}"`);
     });
     revalidatePath("/app", "layout");
-    return { ok: "Saved." };
+    return { ok: date ? "Expiry date saved." : "Expiry date cleared." };
   } catch (e) {
     return fail(e);
   }
@@ -459,6 +840,7 @@ export async function staffUploadAction(_: ActionState, fd: FormData): Promise<A
       data: Buffer.from(await file.arrayBuffer()),
     });
     if (!result.ok) return { error: result.error };
+    await afterWrite(auth.workspace.id);
     revalidatePath("/app", "layout");
     return { ok: "Uploaded." };
   } catch (e) {
@@ -470,7 +852,7 @@ export async function aiAssistAction(_: ActionState, fd: FormData): Promise<Acti
   try {
     const auth = await actionAuth("staff");
     const kind = str(fd, "kind") as AssistKind;
-    if (!["summary", "reminder", "flags"].includes(kind)) return { error: "Unknown request." };
+    if (!(kind in ASSIST_LABEL)) return { error: "Unknown request." };
     const result = await assist(tenantCtx(auth), str(fd, "onboardingId"), kind);
     if (!result) return { error: "Onboarding not found." };
     return { ok: "", data: { ...result, kind } };
@@ -519,8 +901,8 @@ export async function sendManualMessageAction(_: ActionState, fd: FormData): Pro
 // ---------------------------------------------------------------------------
 
 function assertCanEditTemplates(auth: AuthContext) {
-  if (auth.workspace.template_edit_role === "admin" && auth.role !== "admin")
-    throw new Error("Only admins can edit templates in this workspace.");
+  if (auth.workspace.template_edit_role === "admin" && auth.role !== "admin" && auth.role !== "manager")
+    throw new Error("Only admins and managers can edit templates in this workspace.");
 }
 
 export async function createTemplateAction(fd: FormData) {

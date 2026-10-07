@@ -559,3 +559,12 @@ begin
 end $$;
 create trigger onboardings_completion_guard before update of status on onboardings
   for each row execute function app.onboarding_completion_guard();
+
+-- People directory: staff see everyone in their workspace; clients see the team and their own company's contacts,
+-- never other clients' users.
+drop policy mem_read on memberships;
+create policy mem_read on memberships for select using (
+  workspace_id = app.ws() and (app.is_staff() or user_id = app.uid() or role <> 'client' or client_id = app.client()));
+alter table users enable row level security;
+create policy users_read on users for select using (
+  id = app.uid() or exists (select 1 from memberships m where m.user_id = users.id and m.workspace_id = app.ws()));

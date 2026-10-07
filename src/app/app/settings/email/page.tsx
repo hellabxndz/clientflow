@@ -11,8 +11,8 @@ export default async function EmailPage() {
   const auth = await requireStaff();
   const conn = emailConnection(auth.workspace);
   const { rows, counts } = await withTenant(tenantCtx(auth), async (tx) => ({
-    rows: await tx.q<{ id: string; kind: string; to_email: string; subject: string; body: string; status: string; provider: string | null; error: string | null; created_at: Date; client_name: string | null }>(
-      `select e.id, e.kind, e.to_email, e.subject, e.body, e.status, e.provider, e.error, e.created_at, c.name as client_name
+    rows: await tx.q<{ id: string; kind: string; to_email: string; subject: string; body: string; status: string; provider: string | null; error: string | null; status_reason: string | null; created_at: Date; client_name: string | null }>(
+      `select e.id, e.kind, e.to_email, e.subject, e.body, e.status, e.provider, e.error, e.status_reason, e.created_at, c.name as client_name
        from email_messages e left join onboardings o on o.id = e.onboarding_id left join clients c on c.id = o.client_id
        order by e.created_at desc limit 100`,
     ),
@@ -39,6 +39,8 @@ export default async function EmailPage() {
             <li className="flex justify-between"><span>Demo (not sent)</span><span className="tabular-nums">{counts.simulated ?? 0}</span></li>
             <li className="flex justify-between"><span>Failed</span><span className="tabular-nums text-rose-700">{counts.failed ?? 0}</span></li>
             <li className="flex justify-between"><span>Queued</span><span className="tabular-nums">{counts.queued ?? 0}</span></li>
+            <li className="flex justify-between"><span>Scheduled</span><span className="tabular-nums">{counts.scheduled ?? 0}</span></li>
+            <li className="flex justify-between"><span>Skipped or cancelled</span><span className="tabular-nums">{(counts.skipped ?? 0) + (counts.cancelled ?? 0)}</span></li>
           </ul>
         </Card>
       </div>
@@ -58,6 +60,7 @@ export default async function EmailPage() {
                     <Badge tone={r.status === "sent" ? "success" : r.status === "failed" ? "danger" : r.status === "simulated" ? "brand" : "neutral"}>{r.status === "simulated" ? "demo, not sent" : r.status}</Badge>
                   </summary>
                   {r.error && <p className="mt-2 text-sm text-rose-700">{r.error}</p>}
+                  {r.status_reason && <p className="mt-2 text-sm text-ink-600">{r.status_reason}</p>}
                   <pre className="mt-3 whitespace-pre-wrap rounded-lg bg-ink-50 p-3 font-sans text-sm text-ink-700">{r.body}</pre>
                 </details>
               </li>

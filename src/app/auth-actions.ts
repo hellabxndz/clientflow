@@ -10,7 +10,7 @@ export async function loginAction(_: ActionState, fd: FormData): Promise<ActionS
   const email = String(fd.get("email") ?? "").trim().toLowerCase();
   const password = String(fd.get("password") ?? "");
   const ip = (await headers()).get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
-  if (!throttle(`login:${email}:${ip}`)) return { error: "Too many attempts. Please wait a few minutes and try again." };
+  if (!(await throttle(`login:${email}:${ip}`))) return { error: "Too many attempts. Please wait a few minutes and try again." };
   if (!email || !password) return { error: "Enter your email and password." };
   const userId = await verifyCredentials(email, password);
   if (!userId) return { error: "That email and password don't match an account." };
@@ -31,7 +31,7 @@ export async function logoutAction() {
 export async function acceptInviteAction(_: ActionState, fd: FormData): Promise<ActionState> {
   const token = String(fd.get("token") ?? "");
   const ip = (await headers()).get("x-forwarded-for")?.split(",")[0]?.trim() ?? "local";
-  if (!throttle(`invite:${ip}`, 20)) return { error: "Too many attempts. Please wait a few minutes." };
+  if (!(await throttle(`invite:${ip}`, 20))) return { error: "Too many attempts. Please wait a few minutes." };
   const result = await acceptInvitation(token, {
     name: String(fd.get("name") ?? ""),
     password: String(fd.get("password") ?? ""),

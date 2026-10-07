@@ -16,7 +16,7 @@ body {
 
 @layer components {
   .card {
-    @apply rounded-xl border border-ink-200 bg-white shadow-card;
+    @apply min-w-0 rounded-xl border border-ink-200 bg-white shadow-card;
   }
   .input {
     @apply block w-full rounded-lg border border-ink-200 bg-white px-3 py-2 text-[15px] text-ink-900 placeholder:text-ink-400 shadow-sm outline-none transition focus:border-brand-400 focus:ring-4 focus:ring-brand-100 disabled:bg-ink-50 disabled:text-ink-500;

@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import { sysQuery, withSysTx, type TenantContext } from "./db";
 import { randomToken, sha256 } from "./tokens";
+import { rateLimit } from "./rate-limit";
 
 export const SESSION_COOKIE = "cf_session";
 export const SESSION_TTL_DAYS = 14;
@@ -61,18 +62,9 @@ export function validatePassword(password: string): string | null {
 // Login + sessions
 // ---------------------------------------------------------------------------
 
-const attempts = new Map<string, { count: number; first: number }>();
-
-/** Basic in-process throttle. Replace with a shared store (e.g. Redis) when running several instances. */
-export function throttle(key: string, limit = 8, windowMs = 15 * 60 * 1000) {
-  const now = Date.now();
-  const entry = attempts.get(key);
-  if (!entry || now - entry.first > windowMs) {
-    attempts.set(key, { count: 1, first: now });
-    return true;
-  }
-  entry.count += 1;
-  return entry.count <= limit;
+/** Login/invitation throttle shared across instances (Postgres `rate_limits`). Resolves false when the limit is exceeded. */
+export async function throttle(key: string, limit = 8, windowMs = 15 * 60 * 1000) {
+  return (await rateLimit(key, limit, windowMs)).ok;
 }
 
 let dummyHash: string | undefined;

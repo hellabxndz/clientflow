@@ -680,19 +680,41 @@ export async function seed() {
         [ws, c.id, tpl[typeTemplate.name], typeTemplate.name, isoDate(ago(startedAgo)), ago(startedAgo - duration), c.owner, ago(118)],
       );
     }
-    const histRows = historical.map(([name, type, startedAgo, duration]) => ({
-      client_name: name,
-      template: type,
-      start_date: isoDate(ago(startedAgo)),
-      completed_date: isoDate(ago(startedAgo - duration)),
-    }));
+    const histHeader = ["client_name", "template", "start_date", "completed_date", "status"];
+    const histRows = historical.map(([name, type, startedAgo, duration]) => [
+      name,
+      { "Paid Ads": PAID_ADS_TEMPLATE, SEO: SEO_TEMPLATE, Website: WEBSITE_TEMPLATE, "Social Media": SOCIAL_TEMPLATE }[type]!.name,
+      isoDate(ago(startedAgo)),
+      isoDate(ago(startedAgo - duration)),
+      "completed",
+    ]);
     await tx.q(
       `insert into imports (workspace_id, kind, filename, status, header, rows, mapping, summary, created_by, created_at, completed_at)
-       values ($1, 'onboardings', 'past-onboardings-2025.csv', 'completed', '{client_name,template,start_date,completed_date}', $2,
-               '{"client_name":"client_name","template":"template","start_date":"start_date","completed_date":"completed_date"}',
-               '{"created": 6, "skipped": 0, "errors": 0}', $3, $4, $4)`,
-      [ws, JSON.stringify(histRows.map((r) => Object.values(r))), olivia, ago(118)],
+       values ($1, 'onboardings', 'past-onboardings-2025.csv', 'completed', $2, $3, $4, $5, $6, $7, $7)`,
+      [
+        ws,
+        histHeader,
+        JSON.stringify(histRows),
+        JSON.stringify({ client: 0, template: 1, start_date: 2, completed_date: 3, status: 4 }),
+        JSON.stringify({ created: historical.length, skippedDuplicates: 0, failed: 0, errors: [] }),
+        olivia,
+        ago(118),
+      ],
     );
+
+    // Paid Ads v2: published after the fixtures above, so Johnson Dental stays on v1 until someone upgrades it explicitly.
+    const paidV2 = withBrandReviewer(PAID_ADS_TEMPLATE, priya);
+    paidV2.sections.find((s) => s.key === "project")!.items.push({
+      key: "call_tracking",
+      kind: "question",
+      title: "Call tracking preferences",
+      description: "Should we set up call tracking numbers for your ads? If so, which locations?",
+      audience: "client",
+      required: false,
+      dueOffsetDays: 7,
+    });
+    await tx.q("update templates set draft = $2 where id = $1", [tpl[PAID_ADS_TEMPLATE.name], JSON.stringify(paidV2)]);
+    await publishTemplate(tx, tpl[PAID_ADS_TEMPLATE.name], olivia, "Added optional call tracking question");
 
     // ---- History, audit trail and activity ----------------------------------
     await rebuildHistory(tx, ws);

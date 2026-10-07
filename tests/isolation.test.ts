@@ -58,6 +58,20 @@ describe("company (workspace) isolation", () => {
 });
 
 describe("client isolation", () => {
+  it("clients can't list other clients' people, and no one sees users outside their workspace", async () => {
+    const users = await withTenant(w1.ctx.clientA, (tx) => tx.q<{ id: string }>("select id from users"));
+    const ids = users.map((u) => u.id);
+    expect(ids).toContain(w1.clientA.contactId);
+    expect(ids).toContain(w1.staffId);
+    expect(ids).not.toContain(w1.clientB.contactId);
+    expect(ids).not.toContain(w2.staffId);
+    const members = await withTenant(w1.ctx.clientA, (tx) => tx.q<{ user_id: string }>("select user_id from memberships"));
+    expect(members.map((m) => m.user_id)).not.toContain(w1.clientB.contactId);
+    const staffView = await withTenant(w1.ctx.staff, (tx) => tx.q<{ id: string }>("select id from users"));
+    expect(staffView.map((u) => u.id)).toContain(w1.clientB.contactId);
+    expect(staffView.map((u) => u.id)).not.toContain(w2.staffId);
+  });
+
   it("clients only see their own client-facing items", async () => {
     const items = await withTenant(w1.ctx.clientA, (tx) => tx.q<{ client_id: string; audience: string }>("select client_id, audience from onboarding_items"));
     expect(items.length).toBeGreaterThan(0);

@@ -14,7 +14,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export async function createInvitation(
   tx: Tx,
   ctx: TenantContext,
-  input: { email: string; role: "admin" | "staff" | "client"; clientId?: string | null; ttlHours?: number },
+  input: { email: string; role: "admin" | "manager" | "staff" | "client"; clientId?: string | null; ttlHours?: number },
 ) {
   const email = input.email.trim().toLowerCase();
   if (!EMAIL_RE.test(email)) throw new Error("Enter a valid email address.");

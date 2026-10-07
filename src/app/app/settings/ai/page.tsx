@@ -36,8 +36,18 @@ export default async function AiSettingsPage() {
                 <label className="flex items-start gap-3">
                   <input type="checkbox" name="aiProcessDocuments" defaultChecked={auth.workspace.ai_process_documents} className="mt-1 h-4 w-4 rounded" />
                   <span>
-                    <span className="font-medium">Also let AI read uploaded document contents</span>
-                    <span className="mt-1 block text-sm text-ink-600">Off by default. {AI_DOCUMENT_DISCLOSURE}</span>
+                    <span className="flex flex-wrap items-center gap-2 font-medium">
+                      Allow AI to process uploaded documents
+                      <Badge tone={auth.workspace.ai_process_documents ? "warning" : "neutral"}>{auth.workspace.ai_process_documents ? "On" : "Off (default)"}</Badge>
+                    </span>
+                    <span className="mt-1 block text-sm text-ink-600">{AI_DOCUMENT_DISCLOSURE}</span>
+                    <span className="mt-2 block text-sm text-ink-600">What enabling it means:</span>
+                    <ul className="mt-1 list-disc pl-5 text-sm text-ink-600">
+                      <li>That file text leaves ClientFlow and is sent to Anthropic&apos;s API, only when someone clicks an assistant button on that onboarding.</li>
+                      <li>AI may use it to summarize or flag what looks missing. It never approves, rejects or changes any item or document.</li>
+                      <li>AI never approves legal, financial, tax or identity documents. A person always reviews those.</li>
+                      <li>Requires AI assistance to be on. Turning AI off also turns this off.</li>
+                    </ul>
                   </span>
                 </label>
                 <label className="mt-3 flex items-start gap-3 text-sm">
@@ -45,14 +55,14 @@ export default async function AiSettingsPage() {
                   I understand that document text will be sent to an AI provider and that our client agreements allow it.
                 </label>
               </div>
-              {admin && <SubmitButton>Save</SubmitButton>}
+              {admin && <SubmitButton pendingText="Saving…">Save</SubmitButton>}
             </fieldset>
           </ActionForm>
         </Card>
       </div>
       <div className="space-y-6">
         <Notice title="What AI never does">
-          AI never approves items, documents or onboardings, and never makes decisions on legal, tax, identity or financial documents. Every suggestion is labeled and needs a person to act on it.
+          AI never approves items, documents or onboardings, and never approves or makes decisions on legal, financial, tax or identity documents. Every suggestion is labeled and needs a person to act on it.
         </Notice>
         <Card title="Without AI">
           <p className="text-sm text-ink-600">Every assistant button still works without credentials: summaries and blocker explanations come from the checklist state, reminder drafts from a template, and missing-info flags from field rules (empty required answers, malformed emails and URLs, unconfirmed access steps).</p>

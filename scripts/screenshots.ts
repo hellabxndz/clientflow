@@ -9,14 +9,22 @@ const OUT = process.argv[2] ?? "screenshots";
 
 async function ids() {
   const q = async (sql: string, p: unknown[] = []) => (await pool.query(sql, p)).rows[0];
-  const bright = await q("select id from clients where name = 'Brightline Dental Group'");
-  const summit = await q("select id from clients where name = 'Summit Outdoor Supply'");
-  const access = await q("select id from onboarding_items where client_id = $1 and item_key = 'account_access'", [bright.id]);
-  const logos = await q("select id from onboarding_items where client_id = $1 and item_key = 'logo_files'", [bright.id]);
-  const goals = await q("select id from onboarding_items where client_id = $1 and item_key = 'goals_audience'", [bright.id]);
-  const scope = await q("select id from onboarding_items where client_id = $1 and item_key = 'project_scope'", [bright.id]);
-  const tpl = await q("select id from templates where name = 'Marketing agency onboarding'");
-  return { bright: bright.id, summit: summit.id, access: access.id, logos: logos.id, goals: goals.id, scope: scope.id, tpl: tpl.id };
+  const client = async (name: string) => (await q("select id from clients where name = $1", [name])).id as string;
+  const item = async (clientId: string, key: string) => (await q("select id from onboarding_items where client_id = $1 and item_key = $2", [clientId, key])).id as string;
+  const johnson = await client("Johnson Dental");
+  const acme = await client("Acme Fitness");
+  const summit = await client("Summit Roofing");
+  const brightline = await client("Brightline Legal");
+  const tpl = (await q("select id from templates where name = 'Paid Ads Client'")).id;
+  const rule = (await q("select id from automation_rules where name like 'Ready for Kickoff when ads%'")).id;
+  return {
+    johnson, acme, summit, brightline, tpl, rule,
+    jLogo: await item(johnson, "logo_files"),
+    jAds: await item(johnson, "access_google_ads"),
+    jGoals: await item(johnson, "goals_audience"),
+    jFinal: await item(johnson, "final_creative_review"),
+    aLogo: await item(acme, "logo_files"),
+  };
 }
 
 async function login(page: Page, email: string) {
@@ -33,29 +41,43 @@ async function main() {
   const problems: string[] = [];
   const shots: [string, string, string][] = [
     ["staff", "overview", "/app"],
-    ["staff", "reports", "/app/reports"],
     ["staff", "clients", "/app/clients"],
-    ["staff", "client-brightline", `/app/clients/${id.bright}`],
+    ["staff", "clients-waiting-staff", "/app/clients?waiting=staff"],
+    ["staff", "client-johnson", `/app/clients/${id.johnson}`],
+    ["staff", "client-johnson-timeline", `/app/clients/${id.johnson}?tab=timeline`],
     ["staff", "client-summit-ready", `/app/clients/${id.summit}`],
-    ["staff", "item-access-review", `/app/clients/${id.bright}/items/${id.access}`],
-    ["staff", "item-logo-files", `/app/clients/${id.bright}/items/${id.logos}`],
+    ["staff", "client-brightline-at-risk", `/app/clients/${id.brightline}`],
+    ["staff", "item-johnson-logo", `/app/clients/${id.johnson}/items/${id.jLogo}`],
+    ["staff", "item-acme-logo-review", `/app/clients/${id.acme}/items/${id.aLogo}`],
     ["staff", "new-client", "/app/clients/new"],
+    ["staff", "review-queue", "/app/tasks?tab=review"],
+    ["staff", "tasks", "/app/tasks?tab=tasks"],
+    ["staff", "documents", "/app/documents"],
     ["staff", "templates", "/app/templates"],
     ["staff", "template-editor", `/app/templates/${id.tpl}`],
-    ["staff", "tasks", "/app/tasks?who=all"],
-    ["staff", "documents", "/app/documents"],
-    ["staff", "settings-general", "/app/settings"],
+    ["staff", "automations", "/app/automations"],
+    ["staff", "automation-rule", `/app/automations/${id.rule}`],
+    ["staff", "automation-builder", `/app/automations/${id.rule}/edit`],
+    ["staff", "automation-activity", "/app/automations/activity"],
+    ["staff", "integrations", "/app/integrations"],
+    ["staff", "reports", "/app/reports"],
+    ["staff", "notifications", "/app/notifications"],
+    ["staff", "settings-company", "/app/settings"],
+    ["staff", "settings-branding", "/app/settings/branding"],
     ["staff", "settings-team", "/app/settings/team"],
+    ["staff", "settings-client-types", "/app/settings/client-types"],
     ["staff", "settings-reminders", "/app/settings/reminders"],
     ["staff", "settings-email", "/app/settings/email"],
     ["staff", "settings-ai", "/app/settings/ai"],
     ["staff", "settings-security", "/app/settings/security"],
+    ["staff", "settings-import", "/app/settings/import"],
     ["staff", "settings-audit", "/app/settings/audit"],
+    ["staff", "settings-launch", "/app/settings/launch"],
+    ["staff", "settings-pilot-readiness", "/app/settings/pilot-readiness"],
     ["client", "portal-home", "/portal"],
-    ["client", "portal-form", `/portal/items/${id.goals}`],
-    ["client", "portal-access-checklist", `/portal/items/${id.access}`],
-    ["client", "portal-files", `/portal/items/${id.logos}`],
-    ["client", "portal-blocked", `/portal/items/${id.scope}`],
+    ["client", "portal-form", `/portal/items/${id.jGoals}`],
+    ["client", "portal-access", `/portal/items/${id.jAds}`],
+    ["client", "portal-file-changes-requested", `/portal/items/${id.jLogo}`],
   ];
   for (const [vpName, viewport] of [
     ["desktop", { width: 1440, height: 900 }],
@@ -64,10 +86,12 @@ async function main() {
     for (const who of ["staff", "client"] as const) {
       const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === "mobile" ? 2 : 1 });
       const page = await ctx.newPage();
-      page.on("console", (m) => m.type() === "error" && problems.push(`[${vpName}/${who}] console: ${m.text()}`));
-      page.on("pageerror", (e) => problems.push(`[${vpName}/${who}] pageerror: ${e.message}`));
-      await login(page, who === "staff" ? "maya@northwind.example.com" : "marcus@brightline.example.com");
+      let current = "login";
+      page.on("console", (m) => m.type() === "error" && problems.push(`[${vpName}/${who}] ${current} console: ${m.text()}`));
+      page.on("pageerror", (e) => problems.push(`[${vpName}/${who}] ${current} pageerror: ${e.message}`));
+      await login(page, who === "staff" ? "olivia@northstar.example.com" : "john@johnsondental.example.com");
       for (const [role, name, path] of shots.filter((s) => s[0] === who)) {
+        current = name;
         const res = await page.goto(`${BASE}${path}`);
         if (!res || res.status() >= 400) problems.push(`[${vpName}] ${name}: HTTP ${res?.status()}`);
         await page.waitForLoadState("networkidle");

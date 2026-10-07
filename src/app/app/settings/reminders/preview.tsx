@@ -2,10 +2,10 @@
 
 import { useActionState } from "react";
 import { SubmitButton } from "@/components/forms";
-import { previewRuleAction } from "../../actions";
+import { previewReminderRuleAction } from "./actions";
 
 export function PreviewButton({ ruleId }: { ruleId: string }) {
-  const [state, action] = useActionState(previewRuleAction, null);
+  const [state, action] = useActionState(previewReminderRuleAction, null);
   const data = state?.data as { subject: string; body: string; sampleClient: string; timeZone: string } | undefined;
   return (
     <form action={action} className="contents">

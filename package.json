@@ -12,8 +12,10 @@
     "db:reset": "tsx scripts/migrate.ts --reset && tsx scripts/seed.ts",
     "jobs:reminders": "tsx scripts/run-reminders.ts",
     "jobs:retention": "tsx scripts/run-retention.ts",
+    "jobs:tick": "tsx scripts/run-automations.ts",
     "test": "vitest run",
-    "screenshots": "tsx scripts/screenshots.ts"
+    "screenshots": "tsx scripts/screenshots.ts",
+    "e2e": "tsx scripts/e2e-smoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
