@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { STAGE_LABEL, STATUS_LABEL, TASK_STATUS_LABEL, type ItemStatus, type Stage } from "@/lib/onboarding";
+import { STAGE_LABEL, STATUS_LABEL, TASK_STATUS_LABEL, type DisplayStatus, type Stage, type WaitingOn } from "@/lib/onboarding";
 
 export function PageHeader({ title, description, actions }: { title: string; description?: ReactNode; actions?: ReactNode }) {
   return (
@@ -29,18 +29,21 @@ export function Card({ children, className, title, action, padded = true }: { ch
   );
 }
 
-const STATUS_STYLE: Record<ItemStatus, string> = {
-  not_started: "bg-ink-100 text-ink-600 ring-ink-200",
-  in_progress: "bg-sky-50 text-sky-700 ring-sky-200",
-  submitted: "bg-amber-50 text-amber-800 ring-amber-200",
-  changes_requested: "bg-rose-50 text-rose-700 ring-rose-200",
-  approved: "bg-emerald-50 text-emerald-700 ring-emerald-200",
+const STATUS_STYLE: Record<DisplayStatus, { pill: string; dot: string }> = {
+  not_started: { pill: "bg-ink-100 text-ink-600 ring-ink-200", dot: "bg-ink-400" },
+  in_progress: { pill: "bg-sky-50 text-sky-700 ring-sky-200", dot: "bg-sky-500" },
+  submitted: { pill: "bg-amber-50 text-amber-800 ring-amber-200", dot: "bg-amber-500" },
+  under_review: { pill: "bg-violet-50 text-violet-700 ring-violet-200", dot: "bg-violet-500" },
+  changes_requested: { pill: "bg-rose-50 text-rose-700 ring-rose-200", dot: "bg-rose-500" },
+  approved: { pill: "bg-emerald-50 text-emerald-700 ring-emerald-200", dot: "bg-emerald-500" },
+  blocked: { pill: "bg-ink-100 text-ink-500 ring-ink-200", dot: "bg-ink-300" },
 };
 
-export function StatusBadge({ status, task = false, className }: { status: ItemStatus; task?: boolean; className?: string }) {
+export function StatusBadge({ status, task = false, className }: { status: DisplayStatus; task?: boolean; className?: string }) {
+  const style = STATUS_STYLE[status] ?? STATUS_STYLE.not_started;
   return (
-    <span className={clsx("inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset", STATUS_STYLE[status], className)}>
-      <span className={clsx("h-1.5 w-1.5 rounded-full", status === "approved" ? "bg-emerald-500" : status === "changes_requested" ? "bg-rose-500" : status === "submitted" ? "bg-amber-500" : status === "in_progress" ? "bg-sky-500" : "bg-ink-400")} />
+    <span className={clsx("inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset", style.pill, className)}>
+      <span className={clsx("h-1.5 w-1.5 rounded-full", style.dot)} />
       {task ? TASK_STATUS_LABEL[status] : STATUS_LABEL[status]}
     </span>
   );
@@ -160,5 +163,61 @@ export function Tabs({ tabs, active }: { tabs: { href: string; label: string; ke
         </Link>
       ))}
     </nav>
+  );
+}
+
+/** Readiness score with a color that reflects how close the client is to kickoff. */
+export function readinessTone(score: number | null) {
+  if (score == null) return { text: "text-ink-400", bar: "#b9b5c4", ring: "ring-ink-200", bg: "bg-ink-50" };
+  if (score >= 100) return { text: "text-emerald-700", bar: "#10b981", ring: "ring-emerald-200", bg: "bg-emerald-50" };
+  if (score >= 80) return { text: "text-brand-700", bar: "#7c3aed", ring: "ring-brand-200", bg: "bg-brand-50" };
+  if (score >= 60) return { text: "text-amber-700", bar: "#f59e0b", ring: "ring-amber-200", bg: "bg-amber-50" };
+  return { text: "text-rose-700", bar: "#f43f5e", ring: "ring-rose-200", bg: "bg-rose-50" };
+}
+
+export function ReadinessRing({ score, size = 56, label = true }: { score: number | null; size?: number; label?: boolean }) {
+  const tone = readinessTone(score);
+  const r = (size - 6) / 2;
+  const c = 2 * Math.PI * r;
+  const pct = score ?? 0;
+  return (
+    <div className="relative inline-flex shrink-0 items-center justify-center" style={{ width: size, height: size }} aria-label={score == null ? "No readiness score" : `${score}% ready`}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#f1eff5" strokeWidth={5} />
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke={tone.bar} strokeWidth={5} strokeLinecap="round" strokeDasharray={`${(pct / 100) * c} ${c}`} />
+      </svg>
+      {label && <span className={clsx("absolute font-semibold tabular-nums", tone.text, size >= 72 ? "text-lg" : "text-[13px]")}>{score == null ? "–" : `${score}%`}</span>}
+    </div>
+  );
+}
+
+export function ReadinessPill({ score }: { score: number | null }) {
+  const tone = readinessTone(score);
+  return (
+    <span className={clsx("inline-flex items-center whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold tabular-nums ring-1 ring-inset", tone.bg, tone.text, tone.ring)}>
+      {score == null ? "No score" : score >= 100 ? "100% Ready" : `${score}% Ready`}
+    </span>
+  );
+}
+
+const WAITING_LABEL: Record<WaitingOn, string> = { client: "Waiting on Client", staff: "Waiting on Staff", integration: "Waiting on Integration" };
+
+export function WaitingOnBadge({ waitingOn }: { waitingOn: WaitingOn | null }) {
+  if (!waitingOn) return null;
+  const tone = waitingOn === "client" ? "info" : waitingOn === "staff" ? "warning" : "neutral";
+  return <Badge tone={tone}>{WAITING_LABEL[waitingOn]}</Badge>;
+}
+
+export function AtRiskBadge() {
+  return <Badge tone="danger">At Risk</Badge>;
+}
+
+/** A small uppercase label above a value, used in summary strips. */
+export function Meta({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+  return (
+    <div className={clsx("min-w-0", className)}>
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-ink-400">{label}</p>
+      <div className="mt-0.5 text-sm font-medium text-ink-800">{children}</div>
+    </div>
   );
 }

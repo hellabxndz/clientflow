@@ -6,7 +6,7 @@ export const SESSION_COOKIE = "cf_session";
 export const SESSION_TTL_DAYS = 14;
 export const INVITE_TTL_HOURS = Number(process.env.INVITE_TTL_HOURS ?? 168);
 
-export type Role = "admin" | "staff" | "client";
+export type Role = "admin" | "manager" | "staff" | "client";
 
 export interface AuthContext {
   sessionId: string;
@@ -26,6 +26,16 @@ export interface AuthContext {
     retention_days: number | null;
     max_upload_mb: number;
     email_from_name: string | null;
+    accent_color: string;
+    portal_name: string | null;
+    support_email: string | null;
+    support_phone: string | null;
+    logo_storage_key: string | null;
+    business_days: number[];
+    business_start_hour: number;
+    business_end_hour: number;
+    kickoff_lead_days: number;
+    launched_at: Date | null;
   };
   role: Role;
   clientId: string | null;
@@ -120,7 +130,9 @@ export async function resolveSession(token: string | undefined | null): Promise<
     sysQuery<AuthContext["user"]>("select id, email, name from users where id = $1", [session.user_id]),
     sysQuery<AuthContext["workspace"]>(
       `select id, name, slug, is_demo, brand_color, logo_url, portal_welcome, timezone, template_edit_role,
-              ai_enabled, ai_process_documents, retention_days, max_upload_mb, email_from_name
+              ai_enabled, ai_process_documents, retention_days, max_upload_mb, email_from_name, accent_color, portal_name,
+              support_email, support_phone, logo_storage_key, business_days, business_start_hour, business_end_hour,
+              kickoff_lead_days, launched_at
        from workspaces where id = $1`,
       [active.workspace_id],
     ),
@@ -137,7 +149,7 @@ export async function resolveSession(token: string | undefined | null): Promise<
     workspace,
     role: active.role,
     clientId: active.client_id,
-    canApprove: active.role === "admin" || active.can_approve,
+    canApprove: active.role === "admin" || active.role === "manager" || active.can_approve,
     workspaces: memberships.map((m) => ({ id: m.workspace_id, name: m.name, role: m.role, is_demo: m.is_demo })),
   };
 }

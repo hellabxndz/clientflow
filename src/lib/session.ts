@@ -48,6 +48,12 @@ export async function requireAdmin() {
   return auth;
 }
 
+export async function requireManager() {
+  const auth = await requireStaff();
+  if (auth.role !== "admin" && auth.role !== "manager") redirect("/app?denied=1");
+  return auth;
+}
+
 export async function requireClient() {
   const auth = await requireAuth();
   if (auth.role !== "client") redirect("/app");
@@ -55,10 +61,11 @@ export async function requireClient() {
 }
 
 /** For server actions: throws instead of redirecting so failures surface as errors. */
-export async function actionAuth(kind: "staff" | "admin" | "client" | "any" = "any") {
+export async function actionAuth(kind: "staff" | "manager" | "admin" | "client" | "any" = "any") {
   const auth = await getAuth();
   if (!auth) throw new Error("Your session has expired. Please sign in again.");
   if (kind === "staff" && auth.role === "client") throw new Error("Not allowed");
+  if (kind === "manager" && auth.role !== "admin" && auth.role !== "manager") throw new Error("Only managers and admins can do that.");
   if (kind === "admin" && auth.role !== "admin") throw new Error("Only workspace admins can do that.");
   if (kind === "client" && auth.role !== "client") throw new Error("Not allowed");
   return auth;

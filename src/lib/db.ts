@@ -15,7 +15,7 @@ export async function sysQuery<T extends QueryResultRow = QueryResultRow>(text: 
   return res.rows;
 }
 
-export type TenantRole = "admin" | "staff" | "client" | "system";
+export type TenantRole = "admin" | "manager" | "staff" | "client" | "system";
 
 export interface TenantContext {
   workspaceId: string;

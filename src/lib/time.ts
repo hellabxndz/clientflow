@@ -70,3 +70,11 @@ export const COMMON_TIMEZONES = [
   "Pacific/Auckland",
   "UTC",
 ];
+
+/** ISO weekday (1 = Monday … 7 = Sunday) for the instant in a time zone. */
+export function localWeekday(date: Date, timeZone: string) {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short" }).format(date);
+  return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].indexOf(name) + 1;
+}
+
+export const WEEKDAY_LABEL = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];

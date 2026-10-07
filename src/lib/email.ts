@@ -19,7 +19,7 @@ export function emailConnection(workspace: { is_demo: boolean }): { mode: EmailM
 
 export interface OutgoingEmail {
   workspaceId: string;
-  kind: "reminder" | "invitation" | "notification";
+  kind: "reminder" | "invitation" | "notification" | "escalation" | "automation";
   to: string;
   subject: string;
   body: string;
@@ -28,6 +28,7 @@ export interface OutgoingEmail {
   itemIds?: string[];
   dedupeKey?: string | null;
   createdAt?: Date;
+  automationRunId?: string | null;
 }
 
 async function deliverViaResend(fromName: string | null, to: string, subject: string, body: string) {
@@ -54,8 +55,8 @@ export async function sendEmail(
   msg: OutgoingEmail,
 ): Promise<{ id: string; status: "sent" | "simulated" | "failed"; error?: string } | null> {
   const row = await tx.one<{ id: string }>(
-    `insert into email_messages (workspace_id, kind, rule_id, onboarding_id, item_ids, dedupe_key, to_email, subject, body, status, created_at)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued', coalesce($10::timestamptz, now()))
+    `insert into email_messages (workspace_id, kind, rule_id, onboarding_id, item_ids, dedupe_key, to_email, subject, body, status, created_at, automation_run_id)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'queued', coalesce($10::timestamptz, now()), $11)
      on conflict (dedupe_key) do nothing returning id`,
     [
       msg.workspaceId,
@@ -68,10 +69,19 @@ export async function sendEmail(
       msg.subject,
       msg.body,
       msg.createdAt ?? null,
+      msg.automationRunId ?? null,
     ],
   );
   if (!row) return null;
+  return deliverRecorded(tx, workspace, { id: row.id, to: msg.to, subject: msg.subject, body: msg.body });
+}
 
+/** Delivers an already-recorded message according to the workspace's connection mode and stores the outcome. */
+export async function deliverRecorded(
+  tx: Tx,
+  workspace: { is_demo: boolean; email_from_name?: string | null },
+  row: { id: string; to: string; subject: string; body: string },
+): Promise<{ id: string; status: "sent" | "simulated" | "failed"; error?: string }> {
   const conn = emailConnection(workspace);
   if (conn.mode === "demo") {
     await tx.q("update email_messages set status = 'simulated', provider = $2, sent_at = now() where id = $1", [row.id, conn.provider]);
@@ -83,7 +93,7 @@ export async function sendEmail(
     return { id: row.id, status: "failed", error };
   }
   try {
-    const providerId = await deliverViaResend(workspace.email_from_name ?? null, msg.to, msg.subject, msg.body);
+    const providerId = await deliverViaResend(workspace.email_from_name ?? null, row.to, row.subject, row.body);
     await tx.q(
       "update email_messages set status = 'sent', provider = 'resend', provider_message_id = $2, sent_at = now() where id = $1",
       [row.id, providerId],

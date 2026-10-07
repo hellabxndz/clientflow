@@ -3,7 +3,7 @@
 import clsx from "clsx";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { CheckSquare, FileText, LayoutDashboard, LayoutTemplate, Settings, Users } from "lucide-react";
+import { BarChart3, CheckSquare, FileText, LayoutDashboard, LayoutTemplate, Plug, Settings, Users, Workflow } from "lucide-react";
 
 const NAV = [
   { href: "/app", label: "Overview", icon: LayoutDashboard, exact: true },
@@ -11,11 +11,14 @@ const NAV = [
   { href: "/app/templates", label: "Templates", icon: LayoutTemplate },
   { href: "/app/tasks", label: "Tasks", icon: CheckSquare },
   { href: "/app/documents", label: "Documents", icon: FileText },
+  { href: "/app/automations", label: "Automations", icon: Workflow },
+  { href: "/app/reports", label: "Reports", icon: BarChart3 },
+  { href: "/app/integrations", label: "Integrations", icon: Plug },
   { href: "/app/settings", label: "Settings", icon: Settings },
 ];
 
 function isActive(pathname: string, href: string, exact?: boolean) {
-  if (exact) return pathname === href || pathname.startsWith("/app/reports");
+  if (exact) return pathname === href;
   return pathname === href || pathname.startsWith(href + "/");
 }
 

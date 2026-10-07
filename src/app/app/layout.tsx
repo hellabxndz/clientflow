@@ -3,11 +3,18 @@ import { SideNav, MobileNav } from "@/components/staff-nav";
 import { Logo } from "@/components/logo";
 import { Avatar } from "@/components/ui";
 import { logoutAction, switchWorkspaceAction } from "../auth-actions";
-import { LogOut } from "lucide-react";
+import { Bell, LogOut } from "lucide-react";
+import Link from "next/link";
+import { withTenant } from "@/lib/db";
+import { tenantCtx } from "@/lib/auth";
+import { ROLE_LABEL } from "@/lib/permissions";
 
 export default async function StaffLayout({ children }: { children: React.ReactNode }) {
   const auth = await requireStaff();
   const otherWorkspaces = auth.workspaces.filter((w) => w.id !== auth.workspace.id);
+  const unread = await withTenant(tenantCtx(auth), async (tx) =>
+    Number((await tx.one<{ n: number }>("select count(*)::int as n from notifications where user_id = $1 and read_at is null", [auth.user.id]))?.n ?? 0),
+  );
   return (
     <div className="min-h-screen lg:flex">
       <aside className="hidden w-64 shrink-0 flex-col border-r border-ink-200 bg-white lg:flex lg:fixed lg:inset-y-0">
@@ -25,8 +32,9 @@ export default async function StaffLayout({ children }: { children: React.ReactN
             <Avatar name={auth.user.name} />
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-medium">{auth.user.name}</p>
-              <p className="truncate text-xs capitalize text-ink-500">{auth.role}</p>
+              <p className="truncate text-xs text-ink-500">{ROLE_LABEL[auth.role]}</p>
             </div>
+            <NotificationBell unread={unread} />
             <form action={logoutAction}>
               <button className="btn-ghost p-2" title="Sign out" aria-label="Sign out">
                 <LogOut className="h-4 w-4" />
@@ -42,6 +50,7 @@ export default async function StaffLayout({ children }: { children: React.ReactN
             <Logo compact />
             <div className="flex min-w-0 items-center gap-2">
               <WorkspaceSwitcher current={auth.workspace.name} others={otherWorkspaces} compact />
+              <NotificationBell unread={unread} />
               <form action={logoutAction}>
                 <button className="btn-ghost p-2" aria-label="Sign out">
                   <LogOut className="h-4 w-4" />
@@ -85,5 +94,18 @@ function WorkspaceSwitcher({ current, others, compact = false }: { current: stri
         ))}
       </div>
     </details>
+  );
+}
+
+function NotificationBell({ unread }: { unread: number }) {
+  return (
+    <Link href="/app/notifications" className="btn-ghost relative p-2" aria-label={unread ? `${unread} unread notifications` : "Notifications"} title="Notifications">
+      <Bell className="h-4 w-4" />
+      {unread > 0 && (
+        <span className="absolute -right-0.5 -top-0.5 inline-flex min-w-[18px] items-center justify-center rounded-full bg-brand-600 px-1 text-[10px] font-semibold leading-[18px] text-white">
+          {unread > 99 ? "99+" : unread}
+        </span>
+      )}
+    </Link>
   );
 }
