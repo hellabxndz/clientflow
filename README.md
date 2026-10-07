@@ -243,7 +243,7 @@ See [docs/SECURITY.md](docs/SECURITY.md). In short:
 
 ## 12. Before a paid pilot
 
-1. Deploy to a host with HTTPS. Set `APP_URL`, `CRON_SECRET` and a scheduler calling `/api/cron/tick`.
+1. Deploy to a host with HTTPS ([docs/DEPLOY.md](docs/DEPLOY.md) has Railway steps). Set `APP_URL`, `CRON_SECRET` and a scheduler calling `/api/cron/tick`.
 2. Verify a sending domain in Resend (SPF, DKIM, DMARC) and send a test invitation and reminder.
 3. Connect the pilot's CRM in a non-demo workspace. Close a test deal and confirm one client and one onboarding are created.
 4. Connect Slack or Teams and the PM tool, and run "Test connection" until each shows Connected.
