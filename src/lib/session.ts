@@ -36,9 +36,15 @@ export async function requireAuth() {
   return auth;
 }
 
+/** True when this workspace requires two-step sign-in for its team and this staff member hasn't set it up. */
+export function mfaSetupRequired(auth: AuthContext) {
+  return auth.role !== "client" && auth.workspace.require_staff_mfa && !auth.user.mfa_enabled;
+}
+
 export async function requireStaff() {
   const auth = await requireAuth();
   if (auth.role === "client") redirect("/portal");
+  if (mfaSetupRequired(auth)) redirect("/account?required=1");
   return auth;
 }
 
@@ -64,6 +70,7 @@ export async function requireClient() {
 export async function actionAuth(kind: "staff" | "manager" | "admin" | "client" | "any" = "any") {
   const auth = await getAuth();
   if (!auth) throw new Error("Your session has expired. Please sign in again.");
+  if (mfaSetupRequired(auth)) throw new Error("This workspace requires two-step sign-in. Set it up from your account page first.");
   if (kind === "staff" && auth.role === "client") throw new Error("Not allowed");
   if (kind === "manager" && auth.role !== "admin" && auth.role !== "manager") throw new Error("Only managers and admins can do that.");
   if (kind === "admin" && auth.role !== "admin") throw new Error("Only workspace admins can do that.");

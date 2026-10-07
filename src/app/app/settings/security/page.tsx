@@ -11,6 +11,8 @@ import { DOWNLOAD_LINK_TTL_SECONDS } from "@/lib/files";
 import { usingFallbackKey } from "@/lib/integrations/crypto";
 import { validateEnv } from "@/lib/env";
 import { revokeMySessionAction } from "../../actions";
+import { sysQuery } from "@/lib/db";
+import { resetMemberMfaAction, setBlockUnscannedAction, setRequireMfaAction, testScannerAction } from "./actions";
 
 export const metadata = { title: "Security" };
 
@@ -40,6 +42,18 @@ export default async function SecurityPage() {
   const scanner = getScanner();
   const envCheck = validateEnv();
   const inviteDays = Math.max(1, Math.round(INVITE_TTL_HOURS / 24));
+  const isAdmin = auth.role === "admin";
+  const team = await sysQuery<{ id: string; name: string; email: string; role: string; mfa: boolean }>(
+    `select u.id, u.name, u.email, m.role, exists (select 1 from user_mfa f where f.user_id = u.id and f.enabled_at is not null) as mfa
+     from memberships m join users u on u.id = m.user_id where m.workspace_id = $1 and m.role <> 'client' order by u.name`,
+    [auth.workspace.id],
+  );
+  const withMfa = team.filter((t) => t.mfa).length;
+  const [lastTest] = await sysQuery<{ created_at: Date; metadata: { ok?: boolean; detail?: string } }>(
+    "select created_at, metadata from audit_events where workspace_id = $1 and action = 'security.scanner_test' order by created_at desc limit 1",
+    [auth.workspace.id],
+  );
+  const scannerVerified = scanner.configured && lastTest?.metadata?.ok === true;
 
   const implemented: Row[] = [
     { title: "Tenant isolation with row-level security", detail: "Tenant data is queried as a restricted database role. Postgres row-level security scopes every row to this workspace and, for client users, to their own company. Clients can't see internal tasks or internal notes." },
@@ -49,6 +63,8 @@ export default async function SecurityPage() {
     { title: "Invitations", detail: `Single-use, stored only as a hash, and expire after ${inviteDays} day${inviteDays === 1 ? "" : "s"} (${INVITE_TTL_HOURS} hours). A new invitation revokes earlier pending ones for the same email.` },
     { title: "Sessions", detail: `Session tokens are stored hashed, last ${SESSION_TTL_DAYS} days, and can be revoked below or by an admin from the Team page. Removing a member signs them out everywhere.` },
     { title: "Passwords", detail: "Hashed with bcrypt. Clients are never asked for passwords to their own accounts; access requests use delegated access instructions." },
+    { title: "Password reset", detail: "Single-use emailed links that expire after 60 minutes and are stored only as a hash. The form never reveals whether an account exists, and a reset signs the account out everywhere." },
+    { title: "Two-step sign-in (MFA)", detail: `Authenticator-app codes (TOTP) with single-use recovery codes; each code works once. ${team.length ? `${withMfa} of ${team.length} team members have it on.` : ""}${auth.workspace.require_staff_mfa ? " Required for this team." : " Optional for this team."}` },
     { title: "Rate limiting", detail: "Sign-in and invitation acceptance attempts are rate limited per account and IP, shared across app instances through the database." },
     { title: "Audit logging", detail: "Settings, team, invitation, review, upload, reminder, automation, integration and import events are recorded with the actor and time." },
     {
@@ -69,8 +85,7 @@ export default async function SecurityPage() {
 
   const notImplemented: Row[] = [
     { title: "Single sign-on (SSO / SAML)", detail: "Not available. Sign-in is email and password." },
-    { title: "Multi-factor authentication", detail: "Not available in this build." },
-    { title: "Self-service password reset", detail: "Not available. An admin can remove and re-invite a team member." },
+    { title: "SMS, email codes or security keys", detail: "Two-step sign-in supports authenticator apps only. Passkeys and hardware security keys are not available." },
     { title: "Compliance certifications", detail: "ClientFlow has not been audited or certified for SOC 2, HIPAA, GDPR, ISO 27001 or similar. Don't represent it as compliant." },
   ];
 
@@ -119,10 +134,75 @@ export default async function SecurityPage() {
             ))}
           </ul>
         </Card>
+        <Card title="Two-step sign-in" padded={false}>
+          <div className="space-y-3 px-5 py-4">
+            <p className="text-sm text-ink-600">
+              {auth.workspace.require_staff_mfa ? "Required for everyone on the team." : "Optional. Each person can turn it on from their account page."}
+            </p>
+            {isAdmin && (
+              <ActionForm action={setRequireMfaAction}>
+                <input type="hidden" name="on" value={auth.workspace.require_staff_mfa ? "false" : "true"} />
+                <SubmitButton className="btn-secondary px-3 py-1.5 text-xs">{auth.workspace.require_staff_mfa ? "Make optional" : "Require for the team"}</SubmitButton>
+              </ActionForm>
+            )}
+            <Link href="/account" className="inline-block text-sm font-medium text-brand-700 hover:underline">
+              {auth.user.mfa_enabled ? "Manage yours" : "Set up yours"}
+            </Link>
+          </div>
+          <ul className="divide-y divide-ink-100 border-t border-ink-100">
+            {team.map((t) => (
+              <li key={t.id} className="flex items-center justify-between gap-2 px-5 py-2.5">
+                <div className="min-w-0 text-sm">
+                  <p className="truncate font-medium">{t.name}</p>
+                  <p className="truncate text-xs text-ink-500">{t.email}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Badge tone={t.mfa ? "success" : "neutral"}>{t.mfa ? "On" : "Off"}</Badge>
+                  {isAdmin && t.mfa && t.id !== auth.user.id && (
+                    <ActionForm action={resetMemberMfaAction} confirm={`Reset two-step sign-in for ${t.email}? They'll be signed out and must set it up again.`}>
+                      <input type="hidden" name="userId" value={t.id} />
+                      <SubmitButton className="btn-ghost px-2 py-1 text-xs" title="For a lost device">Reset</SubmitButton>
+                    </ActionForm>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </Card>
         <Card title="File scanning">
           <div className="flex items-center justify-between">
             <span className="text-sm">{scanner.configured ? "ClamAV" : "No scanner"}</span>
-            <Badge tone={scanner.configured ? "success" : "warning"}>{scanner.configured ? "Connected" : "Not configured"}</Badge>
+            <Badge tone={scannerVerified ? "success" : "warning"}>
+              {!scanner.configured ? "Not configured" : scannerVerified ? "Connected" : lastTest ? "Test failed" : "Configuration Required"}
+            </Badge>
+          </div>
+          <p className="mt-2 text-xs text-ink-500">
+            {!scanner.configured
+              ? "File scanning integration not configured. Enable before handling sensitive production documents."
+              : lastTest
+                ? `Last test ${formatDateTime(lastTest.created_at)}: ${lastTest.metadata?.detail ?? ""}`
+                : "Configured but not tested yet. Shows Connected only after a test detects the standard EICAR test file."}
+          </p>
+          {isAdmin && scanner.configured && (
+            <ActionForm action={testScannerAction} className="mt-3">
+              <SubmitButton className="btn-secondary px-3 py-1.5 text-xs" pendingText="Testing…">Test scanner</SubmitButton>
+            </ActionForm>
+          )}
+          <div className="mt-4 border-t border-ink-100 pt-3">
+            <p className="text-sm font-medium">Unscanned files</p>
+            <p className="mt-0.5 text-xs text-ink-500">
+              {auth.workspace.block_unscanned_uploads
+                ? "Refused. Clients can't upload while no scanner is available."
+                : "Accepted and marked \"Not scanned\" on every file."}
+            </p>
+            {isAdmin && (
+              <ActionForm action={setBlockUnscannedAction} className="mt-2">
+                <input type="hidden" name="on" value={auth.workspace.block_unscanned_uploads ? "false" : "true"} />
+                <SubmitButton className="btn-secondary px-3 py-1.5 text-xs">
+                  {auth.workspace.block_unscanned_uploads ? "Accept and flag instead" : "Refuse unscanned files"}
+                </SubmitButton>
+              </ActionForm>
+            )}
           </div>
         </Card>
         <Notice tone="warning" title="No certifications">

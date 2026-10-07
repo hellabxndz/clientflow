@@ -30,9 +30,12 @@ export default async function PortalLayout({ children }: { children: React.React
               {client?.name && <span className="block truncate text-xs text-ink-500">{client.name}</span>}
             </span>
           </Link>
-          <form action={logoutAction}>
-            <button className="btn-ghost min-h-[40px] px-3 py-1.5 text-sm">Sign out</button>
-          </form>
+          <div className="flex shrink-0 items-center gap-1">
+            <Link href="/account" className="btn-ghost min-h-[40px] px-3 py-1.5 text-sm">Account</Link>
+            <form action={logoutAction}>
+              <button className="btn-ghost min-h-[40px] px-3 py-1.5 text-sm">Sign out</button>
+            </form>
+          </div>
         </div>
       </header>
       {ws.is_demo && (

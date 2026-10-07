@@ -95,8 +95,9 @@ export async function uploadDocument(
       onboarding_id: string;
       onboarding_status: string;
       max_upload_mb: number;
+      block_unscanned_uploads: boolean;
     }>(
-      `select i.id, i.kind, i.status, i.config, i.client_id, i.onboarding_id, o.status as onboarding_status, w.max_upload_mb
+      `select i.id, i.kind, i.status, i.config, i.client_id, i.onboarding_id, o.status as onboarding_status, w.max_upload_mb, w.block_unscanned_uploads
        from onboarding_items i join onboardings o on o.id = i.onboarding_id join workspaces w on w.id = i.workspace_id
        where i.id = $1`,
       [input.itemId],
@@ -132,6 +133,16 @@ export async function uploadDocument(
       }),
     );
     return { ok: false, error: "This file was flagged by the malware scanner and was not stored." };
+  }
+  if (pre.item.block_unscanned_uploads && scan.status !== "clean") {
+    // The workspace accepts only files a scanner has checked; no scanner, or a scanner error, means no upload.
+    await withTenant(ctx, (tx) =>
+      audit(tx, ctx, "document.rejected_unscanned", "item", input.itemId, `Upload "${safeName(input.filename)}" was refused because it couldn't be scanned`, {
+        scan: scan.status,
+        detail: scan.detail,
+      }),
+    );
+    return { ok: false, error: "Uploads are paused because files can't be scanned right now. Please try again later or contact the team." };
   }
 
   const ext = extensionOf(input.filename);

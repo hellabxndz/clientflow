@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getAuth } from "@/lib/session";
+import { getAuth, mfaSetupRequired } from "@/lib/session";
 import { tenantCtx } from "@/lib/auth";
 import { createDownloadLink } from "@/lib/files";
 
@@ -7,6 +7,7 @@ import { createDownloadLink } from "@/lib/files";
 export async function GET(req: NextRequest) {
   const auth = await getAuth();
   if (!auth) return NextResponse.redirect(new URL("/login", req.url));
+  if (mfaSetupRequired(auth)) return NextResponse.redirect(new URL("/account?required=1", req.url));
   const versionId = req.nextUrl.searchParams.get("v") ?? "";
   if (!/^[0-9a-f-]{36}$/i.test(versionId)) return new NextResponse("Not found", { status: 404 });
   const link = await createDownloadLink(tenantCtx(auth), versionId);

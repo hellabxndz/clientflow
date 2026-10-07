@@ -1,4 +1,4 @@
-import type { Tx } from "./db";
+import { sysQuery, type Tx } from "./db";
 import { env } from "./env";
 import { emailConnection } from "./email";
 import { getScanner } from "./scanning";
@@ -24,7 +24,10 @@ export interface PilotReadiness {
   missing: ReadinessEntry[];
 }
 
-export async function pilotReadiness(tx: Tx, workspace: { is_demo: boolean; ai_enabled: boolean }): Promise<PilotReadiness> {
+export async function pilotReadiness(
+  tx: Tx,
+  workspace: { id: string; is_demo: boolean; ai_enabled: boolean; require_staff_mfa: boolean; block_unscanned_uploads: boolean },
+): Promise<PilotReadiness> {
   const working: ReadinessEntry[] = [];
   const configure: ReadinessEntry[] = [];
   const missing: ReadinessEntry[] = [];
@@ -75,8 +78,29 @@ export async function pilotReadiness(tx: Tx, workspace: { is_demo: boolean; ai_e
 
   // Scanning
   const scanner = getScanner();
-  if (scanner.configured) working.push({ title: "Malware scanning (ClamAV)", detail: `Uploads are scanned by clamd at ${env.clamavHost}:${env.clamavPort}.` });
+  const [scanTest] = await tx.q<{ ok: boolean }>(
+    "select coalesce((metadata->>'ok')::boolean, false) as ok from audit_events where action = 'security.scanner_test' order by created_at desc limit 1",
+  );
+  if (scanner.configured && scanTest?.ok)
+    working.push({ title: "Malware scanning (ClamAV)", detail: `Uploads are scanned by clamd at ${env.clamavHost}:${env.clamavPort}; the last test detected the EICAR test file.`, href: "/app/settings/security" });
+  else if (scanner.configured)
+    configure.push({ title: "Malware scanning", detail: "CLAMAV_HOST is set but the scanner hasn't passed a test. Run \"Test scanner\" in Settings → Security.", href: "/app/settings/security" });
   else configure.push({ title: "Malware scanning", detail: "File scanning integration not configured. Enable before handling sensitive production documents. Set CLAMAV_HOST.", href: "/app/settings/security" });
+  if (!workspace.block_unscanned_uploads)
+    configure.push({ title: "Unscanned files", detail: "Uploads that couldn't be scanned are accepted and flagged. Consider refusing them before collecting sensitive documents.", href: "/app/settings/security" });
+
+  // Sign-in security
+  working.push({ title: "Password reset", detail: "Single-use emailed links, valid for 60 minutes; resetting signs the account out everywhere." });
+  const [mfa] = await sysQuery<{ team: number; on: number }>(
+    `select count(*)::int as team, count(f.user_id)::int as "on" from memberships m
+     left join user_mfa f on f.user_id = m.user_id and f.enabled_at is not null
+     where m.workspace_id = $1 and m.role <> 'client'`,
+    [workspace.id],
+  );
+  if (workspace.require_staff_mfa)
+    working.push({ title: "Two-step sign-in", detail: `Required for the team; ${mfa.on} of ${mfa.team} have set it up.`, href: "/app/settings/security" });
+  else
+    configure.push({ title: "Two-step sign-in", detail: `Available but optional; ${mfa.on} of ${mfa.team} team members use it. Require it for the team before a pilot.`, href: "/app/settings/security" });
 
   // Scheduler
   if (env.cronSecret) working.push({ title: "Scheduled jobs", detail: "CRON_SECRET is set; /api/cron/tick and /api/cron/reminders accept authorized calls. Make sure a scheduler actually calls them." });
@@ -101,8 +125,7 @@ export async function pilotReadiness(tx: Tx, workspace: { is_demo: boolean; ai_e
 
   // Genuine gaps in this build.
   missing.push(
-    { title: "Single sign-on (SSO / SAML) and multi-factor authentication", detail: "Sign-in is email and password only. There is no SSO, SAML or MFA in this build." },
-    { title: "Self-service password reset", detail: "There is no forgot-password flow. An admin can remove and re-invite a user." },
+    { title: "Single sign-on (SSO / SAML), passkeys and security keys", detail: "Sign-in is email and password plus optional authenticator-app codes. There is no SSO, SAML, passkey or hardware-key support." },
     { title: "Custom domain TLS and routing", detail: "The custom domain field records the domain and checks DNS, but certificates and routing are not provisioned automatically." },
     {
       title: "Object storage other than private local disk",

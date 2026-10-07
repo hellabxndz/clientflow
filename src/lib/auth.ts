@@ -11,7 +11,7 @@ export type Role = "admin" | "manager" | "staff" | "client";
 
 export interface AuthContext {
   sessionId: string;
-  user: { id: string; email: string; name: string };
+  user: { id: string; email: string; name: string; mfa_enabled: boolean };
   workspace: {
     id: string;
     name: string;
@@ -37,6 +37,8 @@ export interface AuthContext {
     business_end_hour: number;
     kickoff_lead_days: number;
     launched_at: Date | null;
+    require_staff_mfa: boolean;
+    block_unscanned_uploads: boolean;
   };
   role: Role;
   clientId: string | null;
@@ -119,12 +121,15 @@ export async function resolveSession(token: string | undefined | null): Promise<
   const active = memberships.find((m) => m.workspace_id === session.workspace_id) ?? memberships[0];
 
   const [[user], [workspace]] = await Promise.all([
-    sysQuery<AuthContext["user"]>("select id, email, name from users where id = $1", [session.user_id]),
+    sysQuery<AuthContext["user"]>(
+      "select id, email, name, exists (select 1 from user_mfa f where f.user_id = users.id and f.enabled_at is not null) as mfa_enabled from users where id = $1",
+      [session.user_id],
+    ),
     sysQuery<AuthContext["workspace"]>(
       `select id, name, slug, is_demo, brand_color, logo_url, portal_welcome, timezone, template_edit_role,
               ai_enabled, ai_process_documents, retention_days, max_upload_mb, email_from_name, accent_color, portal_name,
               support_email, support_phone, logo_storage_key, business_days, business_start_hour, business_end_hour,
-              kickoff_lead_days, launched_at
+              kickoff_lead_days, launched_at, require_staff_mfa, block_unscanned_uploads
        from workspaces where id = $1`,
       [active.workspace_id],
     ),
