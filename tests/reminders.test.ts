@@ -132,6 +132,7 @@ describe("eligibility rules", () => {
   const base: ReminderRule = {
     id: "r", workspace_id: "w", name: "r", trigger: "before_due", offset_days: 2, repeat_every_days: null, send_hour: 9,
     subject: "", body: "", enabled: true, previewed_at: new Date(),
+    item_scope: "all", template_id: null, notify_owner: false, business_days_only: false,
   };
   const item = (due: string | null, status = "not_started") => ({ id: "i", title: "t", due_at: due ? new Date(due) : null, status, updated_at: NOW, audience: "client" });
 
@@ -144,5 +145,54 @@ describe("eligibility rules", () => {
   it("ignores internal items and finished items", () => {
     expect(eligibleItems(base, [{ ...item("2026-03-11T17:00:00Z"), audience: "internal" }], new Map(), NOW, "UTC")).toHaveLength(0);
     expect(eligibleItems(base, [item("2026-03-11T17:00:00Z", "approved")], new Map(), NOW, "UTC")).toHaveLength(0);
+  });
+});
+
+describe("scheduled reminders are re-checked at send time", () => {
+  let id: string;
+  beforeEach(async () => {
+    await setup();
+    id = await withSysTx(async (tx) => {
+      const to = (await tx.one<{ email: string }>("select u.email from users u where u.id = $1", [w.clientA.contactId]))!.email;
+      const items = await tx.q<{ id: string }>("select id from onboarding_items where onboarding_id = $1 and item_key in ('business_profile', 'contacts')", [w.clientA.onboardingId]);
+      return (await tx.one<{ id: string }>(
+        `insert into email_messages (workspace_id, kind, onboarding_id, item_ids, to_email, subject, body, status, send_after)
+         values ($1, 'reminder', $2, $3, $4, 'Still needed', E'Hi\n{{item_list}}', 'scheduled', $5) returning id`,
+        [w.workspaceId, w.clientA.onboardingId, items.map((i) => i.id), to, new Date(NOW.getTime() - 60_000)],
+      ))!.id;
+    });
+    // Only the scheduled message is under test here.
+    await withSysTx((tx) => tx.q("update reminder_rules set enabled = false where workspace_id = $1", [w.workspaceId]));
+  });
+  const msg = async () => (await sysQuery<{ status: string; status_reason: string | null }>("select status, status_reason from email_messages where id = $1", [id]))[0];
+
+  it("is delivered (recorded only, in demo) when still relevant", async () => {
+    await runReminders({ now: NOW, workspaceId: w.workspaceId });
+    expect((await msg()).status).toBe("simulated");
+  });
+
+  it("is cancelled when every requested item is completed or removed", async () => {
+    await withSysTx((tx) => tx.q("update onboarding_items set status = 'approved' where onboarding_id = $1 and item_key = 'business_profile'", [w.clientA.onboardingId]));
+    await withSysTx((tx) => tx.q("update onboarding_items set removed_at = now() where onboarding_id = $1 and item_key = 'contacts'", [w.clientA.onboardingId]));
+    await runReminders({ now: NOW, workspaceId: w.workspaceId });
+    expect(await msg()).toEqual({ status: "cancelled", status_reason: "All requested items were completed or removed" });
+  });
+
+  it("is cancelled when the onboarding is paused or the client archived", async () => {
+    await withSysTx((tx) => tx.q("update onboardings set status = 'paused' where id = $1", [w.clientA.onboardingId]));
+    await runReminders({ now: NOW, workspaceId: w.workspaceId });
+    expect(await msg()).toEqual({ status: "cancelled", status_reason: "Onboarding paused" });
+  });
+
+  it("is cancelled when the client is archived", async () => {
+    await withSysTx((tx) => tx.q("update clients set archived_at = now() where id = $1", [w.clientA.id]));
+    await runReminders({ now: NOW, workspaceId: w.workspaceId });
+    expect((await msg()).status_reason).toBe("Client archived");
+  });
+
+  it("is skipped when the recipient no longer has portal access", async () => {
+    await withSysTx((tx) => tx.q("delete from memberships where user_id = $1", [w.clientA.contactId]));
+    await runReminders({ now: NOW, workspaceId: w.workspaceId });
+    expect(await msg()).toEqual({ status: "skipped", status_reason: "Recipient no longer has portal access" });
   });
 });

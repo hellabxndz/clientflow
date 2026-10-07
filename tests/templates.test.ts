@@ -59,16 +59,39 @@ describe("template versioning", () => {
   });
 
   it("copies due dates, owners and dependencies into the onboarding", async () => {
-    const task = await withSysTx((tx) => tx.one<{ owner_user_id: string; depends_on: string[]; due_at: Date; audience: string }>(
-      "select owner_user_id, depends_on, due_at, audience from onboarding_items where onboarding_id = $1 and item_key = 'review_brief'",
+    const rows = await withSysTx((tx) => tx.q<{ item_key: string; owner_user_id: string; depends_on: string[]; due_at: Date | null; audience: string; weight: number; critical: boolean }>(
+      "select item_key, owner_user_id, depends_on, due_at, audience, weight, critical from onboarding_items where onboarding_id = $1",
       [w.clientA.onboardingId],
     ));
-    expect(task!.owner_user_id).toBe(w.staffId);
-    expect(task!.audience).toBe("internal");
-    expect(task!.depends_on).toEqual(["business_profile", "goals_audience", "project_scope"]);
-    expect(task!.due_at).not.toBeNull();
+    const by = Object.fromEntries(rows.map((r) => [r.item_key, r]));
+    const task = by.final_creative_review;
+    expect(task.owner_user_id).toBe(w.staffId);
+    expect(task.audience).toBe("internal");
+    expect(task.depends_on).toEqual(["logo_files", "brand_guidelines", "creative_questionnaire"]);
+    // "Due 2 days after its dependencies are approved": no date until then.
+    expect(task.due_at).toBeNull();
+    expect(by.business_profile.due_at).not.toBeNull();
+    expect(by.access_google_ads.critical).toBe(true);
+    expect(by.business_profile.weight).toBe(3);
+  });
+
+  it("an item due after its dependencies gets its date when the last one is approved", async () => {
+    await withSysTx((tx) =>
+      tx.q("update onboarding_items set status = 'approved' where onboarding_id = $1 and item_key in ('logo_files', 'brand_guidelines')", [w.clientA.onboardingId]),
+    );
+    expect((await itemDue(w.clientA.onboardingId, "final_creative_review"))).toBeNull();
+    await withSysTx((tx) =>
+      tx.q("update onboarding_items set status = 'approved' where onboarding_id = $1 and item_key = 'creative_questionnaire'", [w.clientA.onboardingId]),
+    );
+    const due = await itemDue(w.clientA.onboardingId, "final_creative_review");
+    expect(due).not.toBeNull();
+    expect(Math.round((due!.getTime() - Date.now()) / 86400000)).toBeGreaterThanOrEqual(1);
   });
 });
+
+async function itemDue(onboardingId: string, key: string) {
+  return (await withSysTx((tx) => tx.one<{ due_at: Date | null }>("select due_at from onboarding_items where onboarding_id = $1 and item_key = $2", [onboardingId, key])))!.due_at;
+}
 
 describe("template validation", () => {
   it("accepts the built-in templates", () => {

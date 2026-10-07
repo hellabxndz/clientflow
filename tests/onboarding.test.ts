@@ -32,12 +32,12 @@ describe("onboarding state", () => {
     ];
     const s = computeOnboardingState(onb, items, NOW);
     const by = Object.fromEntries(s.blockers.map((b) => [b.title, b]));
-    expect(by.profile.reason).toBe("overdue");
+    expect(by.profile.category).toBe("deadline_overdue");
     expect(by.profile.waitingOn).toBe("client");
-    expect(by.logo.reason).toBe("changes_requested");
-    expect(by.brief.reason).toBe("dependency");
+    expect(by.logo.category).toBe("waiting_on_client");
+    expect(by.brief.category).toBe("dependency_blocked");
     expect(by.brief.waitingOn).toBe("client");
-    expect(by.review.reason).toBe("awaiting_review");
+    expect(by.review.category).toBe("waiting_on_staff");
     expect(by.review.waitingOn).toBe("staff");
     // Dependency waits on items that aren't due soon are not treated as blockers yet.
     expect(by.later).toBeUndefined();

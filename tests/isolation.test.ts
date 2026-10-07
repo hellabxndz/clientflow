@@ -72,7 +72,7 @@ describe("client isolation", () => {
   it("clients never see internal notes or internal tasks", async () => {
     const comments = await withTenant(w1.ctx.clientA, (tx) => tx.q<{ body: string }>("select body from comments"));
     expect(comments.map((c) => c.body)).toEqual(["hello client"]);
-    const task = await itemByKey(w1.clientA.onboardingId, "review_brief");
+    const task = await itemByKey(w1.clientA.onboardingId, "final_creative_review");
     const row = await withTenant(w1.ctx.clientA, (tx) => tx.one("select * from onboarding_items where id = $1", [task.id]));
     expect(row).toBeNull();
   });

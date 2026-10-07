@@ -544,3 +544,18 @@ drop policy rr_staff on reminder_rules;
 create policy rr_staff_read on reminder_rules for select using (workspace_id = app.ws() and app.is_staff());
 create policy rr_manager_write on reminder_rules for all
   using (workspace_id = app.ws() and app.is_manager()) with check (workspace_id = app.ws() and app.is_manager());
+
+-- Defense in depth: an onboarding can't be marked complete while required items are unapproved,
+-- whichever code path tries (server actions check this too).
+create or replace function app.onboarding_completion_guard() returns trigger
+  language plpgsql security definer set search_path = public, app as $$
+begin
+  if new.status = 'completed' and old.status is distinct from 'completed' and app.role() <> 'none'
+     and exists (select 1 from onboarding_items i where i.onboarding_id = new.id and i.required
+                 and i.removed_at is null and i.status <> 'approved') then
+    raise exception 'This onboarding has required items that are not approved yet.';
+  end if;
+  return new;
+end $$;
+create trigger onboardings_completion_guard before update of status on onboardings
+  for each row execute function app.onboarding_completion_guard();
