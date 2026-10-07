@@ -1,0 +1,32 @@
+# Local services for development and pilots: Postgres and a ClamAV daemon.
+#   docker compose up -d
+#   DATABASE_URL=postgres://postgres:postgres@localhost:5432/clientflow
+#   CLAMAV_HOST=localhost  CLAMAV_PORT=3310
+# ClamAV downloads its signature databases on first start (several hundred MB) and only accepts
+# connections once they are loaded. Then use Settings -> Security -> "Test scanner".
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: clientflow
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 10
+
+  clamav:
+    image: clamav/clamav:stable
+    ports: ["3310:3310"]
+    volumes: [clamdb:/var/lib/clamav]
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      retries: 20
+      start_period: 5m
+
+volumes:
+  pgdata:
+  clamdb:

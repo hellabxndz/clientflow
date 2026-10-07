@@ -36,13 +36,23 @@ Template editing can be opened to all staff from Settings.
 - Sign-in and webhook throttling are stored in Postgres, so they hold across processes.
 - Integration secrets are encrypted with AES-256-GCM under `INTEGRATION_ENCRYPTION_KEY`, which falls back to a key derived from `SESSION_SECRET`, with a warning in the UI. The `clientflow_app` role has no SELECT on the encrypted column.
 
+## Password reset and two-step sign-in
+
+- Reset links are random 256-bit tokens stored as SHA-256 hashes. They are single-use, expire after 60 minutes, and a new request cancels the previous link. The form gives the same answer whether or not the account exists, and requests are throttled per IP and per email. Completing a reset signs the account out everywhere; two-step sign-in stays on.
+- The stored copy of the reset email has the link withheld, so admins reading email logs can't use it. Accounts that only belong to demo workspaces get a simulated email.
+- Two-step sign-in uses TOTP (RFC 6238, SHA-1, 6 digits, 30 seconds, one step of drift). Secrets are encrypted with AES-256-GCM; each accepted step is recorded so a code can't be replayed. Eight recovery codes are shown once and stored as bcrypt hashes. The MFA and reset tables have no grants for `clientflow_app`.
+- After the password, the app sets only a signed, 5-minute, httpOnly challenge cookie. No session exists until the code is accepted. Code attempts are throttled per user. Accepting an invitation doesn't bypass the second step.
+- When a workspace requires two-step sign-in, staff without it can reach only their account page: pages, server actions and file links are all refused server-side.
+- An admin can reset someone's two-step sign-in (lost phone) only if they administer every workspace that person belongs to. The reset signs the person out and is audited.
+
 ## Files
 
 - Files are stored under random keys in `STORAGE_DIR`, outside the web root. There is no public URL.
 - A download first checks access as the signed-in user. It then redirects to a signed link that expires in five minutes and is bound to that user.
 - Type and size limits apply per item and per workspace. Signatures are checked for common formats and executable types are blocked. SVG is refused for branding logos.
 - **Scanning.**
-  - With `CLAMAV_HOST` set, every upload is scanned through clamd and infected files are rejected.
+  - With `CLAMAV_HOST` set, every upload is scanned through clamd and infected files are rejected. "Test scanner" in Settings → Security proves the connection with the EICAR test file; until it passes, the scanner is shown as Configuration Required, not Connected.
+  - "Refuse unscanned files" (off by default) rejects any upload that a scanner didn't check, including while the scanner is unreachable. A scanner error is never treated as clean.
   - Without it, each file is stored as "Not scanned", and the app shows: "File scanning integration not configured. Enable before handling sensitive production documents."
   - Scanning is never faked.
 - Retention purges file bytes after the workspace's retention period.
@@ -93,7 +103,8 @@ Admins can filter it in Settings → Audit Log. Status history per item is kept 
 
 ## Known gaps
 
-- No SSO, SAML or MFA, and no self-service password reset.
+- No SSO or SAML. Two-step sign-in is authenticator-app only; no passkeys or security keys.
+- Production dependencies: `npm audit` reports a PostCSS advisory inside Next.js's build tooling, fixed only in Next 16 (a major upgrade not done here). The critical advisories are in test-only tooling (Vitest), not in the running app.
 - Local-disk storage only: no encryption at rest beyond the host's disk, and no object storage adapter.
 - Bounces and complaints are not processed.
 - There has been no penetration test and no external review of the RLS policies.

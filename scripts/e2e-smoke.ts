@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { chromium, type Page, type Browser } from "playwright";
 import { pool } from "../src/lib/db";
+import { currentStep, totpAt } from "../src/lib/mfa";
+import { randomToken, sha256 } from "../src/lib/tokens";
 
 /**
  * Browser smoke test against a running app with freshly seeded demo data (`npm run db:reset`).
@@ -123,6 +125,54 @@ async function main() {
   const connected = await sarah.getByText("Connected", { exact: true }).count();
   if (connected > 0) throw new Error("an integration claims to be connected in the demo");
   step("integrations hub shows honest states");
+
+  // 8. Two-step sign-in: Michael turns it on, then needs a code to sign in.
+  const michael = await login(browser, "michael@northstar.example.com");
+  await michael.goto(`${BASE}/account`);
+  await michael.click("text=Set up two-step sign-in");
+  await expectText(michael, "Scan this code");
+  const secret = (await michael.locator("p.font-mono").first().innerText()).replace(/\s/g, "");
+  await michael.fill("input[name=code]", totpAt(secret, currentStep()));
+  await michael.click("text=Turn on two-step sign-in");
+  await expectText(michael, "Save these recovery codes now");
+  const fresh = await browser.newContext();
+  const again = await fresh.newPage();
+  await again.goto(`${BASE}/login`);
+  await again.fill("#email", "michael@northstar.example.com");
+  await again.fill("#password", "demo-password-123");
+  await Promise.all([again.waitForURL(/\/login\/verify/), again.click("button[type=submit]")]);
+  await again.fill("#code", "000000");
+  await again.click("button[type=submit]");
+  await expectText(again, "That code didn't work");
+  await again.fill("#code", totpAt(secret, currentStep() + 1));
+  await Promise.all([again.waitForURL(/\/app/), again.click("button[type=submit]")]);
+  step("two-step sign-in: set up from the account page, then required at sign-in");
+
+  // 9. Password reset: the request never reveals accounts; a link sets a new password and signs out other sessions.
+  const anon = await (await browser.newContext()).newPage();
+  await anon.goto(`${BASE}/forgot`);
+  await anon.fill("#email", "marcus@northstar.example.com");
+  await anon.click("button[type=submit]");
+  await expectText(anon, "If that email has an account");
+  if ((await q("select count(*)::int as n from password_resets r join users u on u.id = r.user_id where u.email = 'marcus@northstar.example.com'")).n !== 1)
+    throw new Error("reset link not created");
+  const mail = await q("select body, status from email_messages where kind = 'security' and to_email = 'marcus@northstar.example.com'");
+  if (mail.status !== "simulated" || /\/reset\/[\w-]{20,}/.test(mail.body)) throw new Error("reset email was sent or logged the link");
+  const marcus = await login(browser, "marcus@northstar.example.com");
+  const token = randomToken();
+  await q("update password_resets set token_hash = $1 where used_at is null and user_id = (select id from users where email = 'marcus@northstar.example.com')", [sha256(token)]);
+  await anon.goto(`${BASE}/reset/${token}`);
+  await anon.fill("#password", "a-new-pilot-password");
+  await anon.fill("#confirm", "a-new-pilot-password");
+  await Promise.all([anon.waitForURL(/\/login\?reset=1/), anon.click("button[type=submit]")]);
+  await marcus.goto(`${BASE}/app`);
+  if (!marcus.url().includes("/login")) throw new Error("old session survived a password reset");
+  await anon.fill("#email", "marcus@northstar.example.com");
+  await anon.fill("#password", "a-new-pilot-password");
+  await Promise.all([anon.waitForURL(/\/app/), anon.click("button[type=submit]")]);
+  await anon.goto(`${BASE}/reset/${token}`);
+  await expectText(anon, "already used");
+  step("password reset by link: no account leak, link logged without the URL, old sessions signed out, single use");
 
   await browser.close();
   await pool.end();

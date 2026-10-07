@@ -67,6 +67,11 @@ The demo is a marketing agency, **Northstar Growth Agency (Demo)**. A second dem
 - **CSV import.** Clients, contacts, historical onboardings, tasks and requirements, with column mapping, validation, duplicate detection and an import log. Imported history feeds the before/after report.
 - **Client timeline.** Status changes, reviews, uploads, comments, automations, reminders and handoffs in one list per client.
 - **Multi-workspace and roles.** Admin, Manager, Staff, Client. Every permission is checked in the server action and again by Postgres row-level security.
+- **Sign-in security.**
+  - Password reset by emailed link: single-use, valid 60 minutes, stored only as a hash, never reveals whether an account exists, and signs the account out everywhere. The link is withheld from the stored email log.
+  - Two-step sign-in with any authenticator app (TOTP), set up from **Your account** with a QR code, plus 8 single-use recovery codes. Each code works once. The secret is encrypted at rest.
+  - Admins can require two-step sign-in for the whole team (enforced on every page, action and download) and reset it for someone who lost their phone.
+  - Users can change their password; other devices are signed out.
 - **Security and audit.**
   - Audit log of sign-ins, reviews, uploads, downloads, invitations, settings, automations, integrations and AI use, filterable in Settings.
   - Sessions can be revoked.
@@ -113,10 +118,11 @@ See `.env.example` for every variable with comments.
 - SQL files live in `db/migrations`:
   - `001_init.sql` is the core schema, roles, row-level security and triggers.
   - `002_operations.sql` adds automations, readiness, CRM, integrations, imports, notifications, the manager role and the extra policies.
+  - `003_account_security.sql` adds password reset links, two-step sign-in and the scanning policy setting.
 - `npm run db:migrate` applies pending files in order and records them in `schema_migrations`.
 - `npm run db:reset` drops everything, migrates and reseeds the demo. Never run it against real data.
 - The first migration creates the `clientflow_app` role that requests switch to so RLS applies. The connecting user needs permission to create roles once. On a managed database, create the role by hand first.
-- Upgrading an existing ClientFlow MVP database: back it up, then run `npm run db:migrate`. `002` only adds tables, columns, functions and policies, and backfills defaults.
+- Upgrading an existing ClientFlow MVP database: back it up, then run `npm run db:migrate`. `002` and `003` only add tables, columns, functions and policies, and backfill defaults.
 
 ## 5. Development setup
 
@@ -150,7 +156,7 @@ Admins configure integrations under **Integrations**. Demo workspaces refuse liv
 | Slack / Microsoft Teams | Incoming webhook URL / Workflows webhook URL | "Test connection" posts a test message; only success marks it Connected |
 | ClickUp / Asana / Monday.com | API token plus list / project / board id | Used by the "Create PM task" action and the kickoff handoff |
 | Resend | `RESEND_API_KEY`, `EMAIL_FROM` on a verified domain | Shown in Settings → Email |
-| ClamAV | `CLAMAV_HOST` | Without it every file says "Not scanned" |
+| ClamAV | `CLAMAV_HOST`, `CLAMAV_PORT` (`docker compose up -d clamav` runs one locally) | Without it every file says "Not scanned". Settings → Security → **Test scanner** sends the standard EICAR test file; the scanner shows Connected only after that test passes. **Refuse unscanned files** blocks uploads whenever no scanner answers |
 | Anthropic | `ANTHROPIC_API_KEY` | Settings → AI lists exactly what is sent |
 
 Map each CRM service type to a **client type** (Settings → Client Types). Each client type has a template and a default owner, which together decide the onboarding and owner that a won deal gets.
@@ -187,7 +193,7 @@ npm run screenshots -- ./shots   # 38 screens at 1440px and 390px; flags overflo
 
 Results from this build:
 
-- **Unit and integration tests:** 13 files, 114 tests, all passing. They cover:
+- **Unit and integration tests:** 15 files, 128 tests, all passing (with `CLAMAV_TEST_HOST` set; 127 without, because the live ClamAV test is skipped). They cover:
   - Tenant and client isolation, including the user and membership directory.
   - Role permissions, and integration credentials being unreadable.
   - Automation dedupe, conditions and loop safety, plus the completion guard.
@@ -197,13 +203,15 @@ Results from this build:
   - Template versioning and upgrades.
   - Reminders: quiet hours, stop conditions and send-time re-checks.
   - Files, invitations, sessions and retention.
-- **Browser walk-through:** all 10 checks passed, covering the product story above, client isolation (another client's item returns 404 and the staff app redirects), honest integration states, and no real email sent.
+  - Password reset (single use, expiry, sign-out everywhere, no link in the log) and two-step sign-in (RFC 6238 test vectors, replay refusal, single-use recovery codes, encrypted secret unreadable by the app role).
+  - Malware scanning against a real clamd: detects the EICAR test file, passes a clean file, treats an unreachable scanner as an error. This test found and fixed a bug where every clean file would have been marked as a scanner error. It ran against a local clamd loaded with only a test signature, because this environment couldn't download ClamAV's signature databases.
+- **Browser walk-through:** all 12 checks passed, covering the product story above, client isolation (another client's item returns 404 and the staff app redirects), honest integration states, no real email sent, setting up and using two-step sign-in, and a full password reset.
 - **Screens:** 76 captures (38 desktop, 38 mobile). No horizontal overflow and no console errors.
 - **Type check:** `tsc --noEmit` is clean, and `next build` succeeds.
 
 ## 9. Limitations
 
-- No SSO, SAML or MFA, and no self-service password reset. An admin removes and re-invites a user instead.
+- No SSO or SAML. Two-step sign-in supports authenticator apps only (no SMS, passkeys or security keys).
 - Files are stored on local private disk only. That means one app instance, unless the storage directory is shared.
 - No integration has been verified against a live account. See [Partial features](#2-partial-features).
 - Custom domains are not provisioned (TLS, routing).
@@ -224,11 +232,11 @@ See [docs/SECURITY.md](docs/SECURITY.md). In short:
 
 ## 11. Before handling sensitive production documents
 
-1. Configure malware scanning (`CLAMAV_HOST`). Until then the UI says "File scanning integration not configured. Enable before handling sensitive production documents."
-2. Decide whether unscanned files should be blocked rather than flagged.
+1. Run ClamAV with up-to-date signatures (`docker-compose.yml` has one), set `CLAMAV_HOST`, and press **Test scanner** in Settings → Security until it shows Connected. Until then the UI says "File scanning integration not configured. Enable before handling sensitive production documents."
+2. Turn on **Refuse unscanned files**, so an outage of the scanner stops uploads instead of letting unscanned files in.
 3. Move files to encrypted object storage (S3-compatible, with server-side encryption and backups). The `StorageAdapter` interface in `src/lib/storage.ts` is the place to add it.
 4. Set a dedicated `INTEGRATION_ENCRYPTION_KEY` and a strong `SESSION_SECRET`, and keep both in a secret manager.
-5. Add MFA for staff, and a password reset or magic-link flow.
+5. Turn on **Require two-step sign-in for the team** (Settings → Security) once every admin has set it up.
 6. Commission an external penetration test and an RLS policy review.
 7. Write a privacy policy and data processing terms. Decide the retention period and the AI document setting per workspace.
 8. Set up backups with a tested restore, error monitoring, and log retention.
